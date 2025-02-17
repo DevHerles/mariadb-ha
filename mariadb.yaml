@@ -1,0 +1,250 @@
+# mariadb-galera.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mariadb-galera-config
+data:
+  mariadb.cnf: |
+    [mysqld]
+    bind-address=0.0.0.0
+    default_storage_engine=InnoDB
+    binlog_format=row
+    innodb_autoinc_lock_mode=2
+    innodb_flush_log_at_trx_commit=0
+    innodb_buffer_pool_size=128M
+    
+    # Galera Configuration
+    wsrep_on=ON
+    wsrep_provider=/usr/lib/galera/libgalera_smm.so
+    wsrep_provider_options="gcache.size=300M; gcache.page_size=300M"
+    wsrep_cluster_name="galera_cluster"
+    wsrep_cluster_address="__GCOMM_ADDRESS__"
+    wsrep_sst_method=mariabackup
+    wsrep_sst_auth=root:rootpassword
+    wsrep_node_address="__NODE_IP__"
+    wsrep_node_name="__NODE_NAME__"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb-galera
+  labels:
+    app: mariadb-galera
+spec:
+  clusterIP: None
+  selector:
+    app: mariadb-galera
+  ports:
+  - port: 3306
+    name: mysql
+  - port: 4444
+    name: sst
+  - port: 4567
+    name: replication
+  - port: 4568
+    name: ist
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb-galera-client
+  labels:
+    app: mariadb-galera
+spec:
+  type: ClusterIP
+  selector:
+    app: mariadb-galera
+  ports:
+  - port: 3306
+    targetPort: 3306
+    name: mysql
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mariadb-galera-secret
+type: Opaque
+data:
+  mysql-root-password: cm9vdHBhc3N3b3Jk  # echo -n "rootpassword" | base64
+  mysql-password: dXNlcnBhc3N3b3Jk        # echo -n "userpassword" | base64
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb-galera
+spec:
+  serviceName: mariadb-galera
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mariadb-galera
+  template:
+    metadata:
+      labels:
+        app: mariadb-galera
+    spec:
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsUser: 999
+      initContainers:
+      - name: init-config
+        image: tanzu-harbor.pngd.gob.pe/mef-ped-prod/busybox:1.32
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -ex
+
+          mkdir -p /work-dir
+
+          cp /config/mariadb.cnf /work-dir/mariadb.cnf
+          POD_IP=$(hostname -i)
+          POD_INDEX=$(hostname | rev | cut -d- -f1 | rev)
+          
+          if [ "$POD_INDEX" -eq 0 ]; then
+            CLUSTER_ADDRESS="gcomm://"
+          else
+            CLUSTER_ADDRESS="gcomm://mariadb-galera-0.mariadb-galera:4567,mariadb-galera-1.mariadb-galera:4567,mariadb-galera-2.mariadb-galera:4567"
+          fi
+          
+          sed -i "s/__NODE_IP__/$POD_IP/g" /work-dir/mariadb.cnf
+          sed -i "s/__NODE_NAME__/${POD_NAME}/g" /work-dir/mariadb.cnf
+          sed -i "s|__GCOMM_ADDRESS__|$CLUSTER_ADDRESS|g" /work-dir/mariadb.cnf
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: work-dir
+          mountPath: /work-dir
+      containers:
+      - name: mariadb-galera
+        image: tanzu-harbor.pngd.gob.pe/mef-ped-prod/mariadb:10.6
+        securityContext:
+          runAsUser: 999
+          runAsGroup: 999
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          echo "Checking for existing database..."
+          ls -la /var/lib/mysql
+          echo "Checking for existing database..."
+          
+          if [ ! -f /var/lib/mysql/mysql/user.frm ]; then
+            echo "Initializing database..."
+            
+            mariadb-install-db --datadir=/var/lib/mysql --skip-test-db --auth-root-authentication-method=normal
+            
+            /usr/sbin/mysqld --user=mysql --skip-networking &
+            pid="$!"
+            
+            for i in {30..0}; do
+              if mysql --protocol=socket -uroot -e "SELECT 1" &> /dev/null; then
+                break
+              fi
+              echo 'MySQL init process in progress...'
+              sleep 1
+            done
+            
+            mysql --protocol=socket -uroot << EOSQL
+              SET @@SESSION.SQL_LOG_BIN=0;
+              ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+              GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
+              GRANT ALL ON *.* TO 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' WITH GRANT OPTION;
+              FLUSH PRIVILEGES;
+          EOSQL
+            
+            if ! kill -s TERM "$pid" || ! wait "$pid"; then
+              echo >&2 'MySQL init process failed.'
+              exit 1
+            fi
+          fi
+          
+          if [[ $(hostname) == *-0 ]]; then
+            echo "Initializing cluster..."
+            exec /usr/sbin/mysqld --wsrep-new-cluster --user=mysql
+            echo "Cluster initialization successful."
+          else
+            until mysql -h mariadb-galera-0.mariadb-galera -uroot -p${MYSQL_ROOT_PASSWORD} -e "SELECT 1"; do
+              echo "Waiting for first node to be ready..."
+              sleep 5
+            done
+            exec /usr/sbin/mysqld --user=mysql
+          fi
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mariadb-galera-secret
+              key: mysql-root-password
+        ports:
+        - containerPort: 3306
+          name: mysql
+        - containerPort: 4444
+          name: sst
+        - containerPort: 4567
+          name: replication
+        - containerPort: 4568
+          name: ist
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/lib/mysql
+        - name: work-dir
+          mountPath: /etc/mysql/mariadb.cnf
+          subPath: mariadb.cnf
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e 'SELECT 1'
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e 'SELECT 1'
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: mariadb-galera-config
+      - name: work-dir
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      storageClassName: nfs-client
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mariadb-galera-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mariadb-galera
