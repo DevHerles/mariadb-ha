@@ -1,23 +1,36 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mariadb-backup-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-static
+  nfs:
+    server: 10.9.9.27  # Reemplázalo con la IP de tu servidor NFS
+    path: /mnt/pngd_vaultwarden  # Ruta fija en NFS
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: mariadb-restore-pvc
+  name: mariadb-backup-pvc
 spec:
-  storageClassName: nfs-client
+  storageClassName: nfs-static
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
-
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: mariadb-restore
 spec:
-  schedule: "0 17 * * *"  # 12:00 PM Lima (UTC-5) = 5:00 PM UTC
+  schedule: "*/10 * * * *"  # Runs every 10 minutes
   jobTemplate:
     spec:
       template:
@@ -31,6 +44,7 @@ spec:
             - -c
             - |
               set -ex
+
               echo "Finding latest backup..."
               LATEST_BACKUP=$(ls -t /backup/vaultwarden-backup-*.sql.gz | head -1)
               
@@ -56,4 +70,4 @@ spec:
           volumes:
           - name: backup-volume
             persistentVolumeClaim:
-              claimName: mariadb-restore-pvc  # Same PVC as backups
+              claimName: mariadb-backup-pvc  # Same PVC as backups
