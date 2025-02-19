@@ -1,0 +1,59 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-restore-pvc
+spec:
+  storageClassName: nfs-client
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mariadb-restore
+spec:
+  schedule: "0 17 * * *"  # 12:00 PM Lima (UTC-5) = 5:00 PM UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: restore
+            image: mariadb:10.6  # Same as backup image
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -ex
+              echo "Finding latest backup..."
+              LATEST_BACKUP=$(ls -t /backup/vaultwarden-backup-*.sql.gz | head -1)
+              
+              echo "Dropping existing database (if any)..."
+              mysql -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD} -e "DROP DATABASE IF EXISTS vaultwarden;" || true
+              
+              echo "Restoring $LATEST_BACKUP..."
+              zcat "$LATEST_BACKUP" | mysql -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD}
+              
+              echo "Restore complete!"
+            env:
+            - name: TZ
+              value: "America/Lima"
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mariadb-galera-secret
+                  key: mysql-root-password
+            volumeMounts:
+            - name: backup-volume
+              mountPath: /backup
+          restartPolicy: OnFailure
+          volumes:
+          - name: backup-volume
+            persistentVolumeClaim:
+              claimName: mariadb-restore-pvc  # Same PVC as backups
