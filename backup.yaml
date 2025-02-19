@@ -17,7 +17,7 @@ kind: CronJob
 metadata:
   name: mariadb-backup
 spec:
-  schedule: "* 8,12,18 * * *"  # Runs daily at 08:00, 12:00, and 18:00
+  schedule: "* * * * *"  # Runs daily at 08:00, 12:00, and 18:00
   jobTemplate:
     spec:
       template:
@@ -31,12 +31,12 @@ spec:
             - |
               set -ex
               DATE=$(date +%Y%m%d-%H%M%S)
-              echo "Backing up MariaDB to /backup/mariadb-backup-${DATE}.sql.gz"
-              mysqldump -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD} --all-databases --single-transaction > /backup/mariadb-backup-${DATE}.sql
+              echo "Backing up MariaDB to /backup/vaultwarden-backup-${DATE}.sql.gz"
+              mysqldump -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD} --databases vaultwarden --single-transaction > /backup/vaultwarden-backup-${DATE}.sql
               echo "Compressing backup"
-              gzip /backup/mariadb-backup-${DATE}.sql
+              gzip /backup/vaultwarden-backup-${DATE}.sql
               echo "Deleting backups older than 30 days"
-              find /backup -name "mariadb-backup-*.sql.gz" -mtime +30 -exec rm {} \;
+              find /backup -name "vaultwarden-backup-*.sql.gz" -mtime +30 -exec rm {} \;
               echo "Done"
             env:
             - name: MYSQL_ROOT_PASSWORD
