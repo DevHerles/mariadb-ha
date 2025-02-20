@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: mariadb-backup-pv
+  name: mariadb-restore-pv
 spec:
   capacity:
     storage: 10Gi
@@ -16,7 +16,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: mariadb-backup-pvc
+  name: mariadb-restore-pvc
 spec:
   storageClassName: nfs-static
   accessModes:
@@ -30,7 +30,7 @@ kind: CronJob
 metadata:
   name: mariadb-restore
 spec:
-  schedule: "*/10 * * * *"  # Runs every 10 minutes
+  schedule: "*/12 * * * *"  # Runs every 10 minutes
   jobTemplate:
     spec:
       template:
@@ -76,4 +76,4 @@ spec:
           volumes:
           - name: backup-volume
             persistentVolumeClaim:
-              claimName: mariadb-backup-pvc  # Same PVC as backups
+              claimName: mariadb-restore-pvc  # Same PVC as backups
