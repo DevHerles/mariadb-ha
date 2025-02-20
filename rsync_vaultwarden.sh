@@ -2,7 +2,7 @@
 set -e  # Detiene la ejecución si hay un error
 
 # Configuración
-SRC_DIR="/mnt/vw/mariadb-mariadb-backup-pvc-pvc-e6a0313c-494c-4001-8fcf-162d6eb122c7"
+SRC_DIR="/mnt/vaultwarden_backup"
 DEST_DIR="/mnt/pngd_vaultwarden"
 REMOTE_USER="root"
 REMOTE_HOST="10.9.9.27"
