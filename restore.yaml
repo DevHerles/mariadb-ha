@@ -46,14 +46,20 @@ spec:
               set -ex
 
               echo "Finding latest backup..."
-              LATEST_BACKUP=$(ls -t /backup/vaultwarden-backup-*.sql.gz | head -1)
-              
+              LATEST_BACKUP=$(ls -t /backup/vaultwarden-backup-*.sql.gz 2>/dev/null | head -1)
+
+              # Verificar si LATEST_BACKUP está vacío
+              if [ -z "$LATEST_BACKUP" ]; then
+                echo "No backup file found! Exiting..."
+                exit 1
+              fi
+
               echo "Dropping existing database (if any)..."
               mysql -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD} -e "DROP DATABASE IF EXISTS vaultwarden;" || true
-              
+
               echo "Restoring $LATEST_BACKUP..."
               zcat "$LATEST_BACKUP" | mysql -h mariadb-galera-client -u root -p${MYSQL_ROOT_PASSWORD}
-              
+
               echo "Restore complete!"
             env:
             - name: TZ
