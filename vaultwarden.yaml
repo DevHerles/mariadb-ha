@@ -48,6 +48,8 @@ spec:
           ports:
             - containerPort: 80
           env:
+            - name: TZ
+              value: "America/Lima"
             - name: DATABASE_URL
               value: "mysql://root:rootpassword@mariadb-galera-client.mariadb.svc.cluster.local:3306/vaultwarden"
           volumeMounts:

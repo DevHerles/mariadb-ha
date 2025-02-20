@@ -116,6 +116,8 @@ spec:
           sed -i "s/__NODE_NAME__/${POD_NAME}/g" /work-dir/mariadb.cnf
           sed -i "s|__GCOMM_ADDRESS__|$CLUSTER_ADDRESS|g" /work-dir/mariadb.cnf
         env:
+        - name: TZ
+          value: "America/Lima"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -184,6 +186,8 @@ spec:
             exec /usr/sbin/mysqld --user=mysql
           fi
         env:
+        - name: TZ
+          value: "America/Lima"
         - name: MYSQL_ROOT_PASSWORD
           valueFrom:
             secretKeyRef:

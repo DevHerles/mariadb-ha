@@ -39,6 +39,8 @@ spec:
               find /backup -name "vaultwarden-backup-*.sql.gz" -mtime +30 -exec rm {} \;
               echo "Done"
             env:
+            - name: TZ
+              value: "America/Lima"
             - name: MYSQL_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
