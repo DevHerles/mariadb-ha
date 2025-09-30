@@ -1,0 +1,53 @@
+################################################################################
+# Archivo de Configuración para Despliegue de MariaDB Galera HA
+# Ejemplo de uso múltiple para diferentes entornos
+################################################################################
+
+# Información del deployment
+deployment:
+  name: mariadb-galera-prod           # Nombre único del deployment
+  namespace: database-prod            # Namespace donde se desplegará
+  chartVersion: latest                # Versión del chart de Bitnami (opcional)
+
+# Configuración de Storage
+storage:
+  className: mariadb-nfs-prod         # Nombre del StorageClass (debe ser único)
+  size: 50Gi                          # Tamaño del volumen
+  
+  # Configuración NFS
+  nfs:
+    server: 10.10.10.100              # IP o hostname del servidor NFS
+    path: /exports/mariadb/prod       # Path en el servidor NFS
+
+# Credenciales (usar secretos seguros en producción)
+credentials:
+  rootPassword: "SuperSecureRootPass123!"
+  username: "wso2carbon"
+  password: "SecureUserPass456!"
+  database: "WSO2AM_DB"
+  backupPassword: "BackupPass789!"
+
+# Configuración del Registry
+registry:
+  url: "tanzu-harbor.pngd.gob.pe/pcm"
+  pullSecret: "harbor-registry-secret"
+
+# Configuración de Alta Disponibilidad
+ha:
+  replicaCount: 3                     # Número de réplicas (mínimo 3 para HA)
+  minAvailable: 2                     # Pods mínimos disponibles durante updates
+
+# Recursos
+resources:
+  requests:
+    cpu: "1000m"                      # CPU request
+    memory: "4Gi"                     # Memoria request
+  limits:
+    cpu: "2000m"                      # CPU limit
+    memory: "8Gi"                     # Memoria limit
+
+# Configuración de Backups
+backup:
+  enabled: true                       # Habilitar backups automáticos
+  schedule: "0 2 * * *"               # Cron schedule (2 AM diario)
+  retention: 7                        # Días de retención de backups
