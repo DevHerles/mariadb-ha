@@ -11,6 +11,7 @@ Environment=KUBECONFIG=/home/admin/.kube/config
 Environment=NS=<nextcloud>
 Environment=STS=<mariadb>
 Environment=CTX=<my-k8s-context>
+Environment=PVC=<data-mariadb-0>
 Environment=DATA_DIR=/var/lib/mysql
 Environment=SLEEP_SECONDS=30
 ExecStartPre=/bin/sh -c 'KUBECONFIG=/home/admin/.kube/config kubectl --request-timeout=5s get ns >/dev/null'
@@ -25,3 +26,4 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+

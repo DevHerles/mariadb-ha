@@ -26,6 +26,7 @@ OPTIONS:
     -n, --namespace NS          Kubernetes namespace (required)
     -s, --statefulset STS       StatefulSet name (required)
     -c, --context CTX           Kubernetes context (required)
+    -p, --pvc PVC               PVC name (required)
     -d, --description DESC      Service description (optional, default: "MariaDB Galera HA Watchdog")
     -h, --help                  Show this help message
 
@@ -40,6 +41,7 @@ EOF
 NS=""
 STS=""
 CTX=""
+PVC=""
 DESCRIPTION="MariaDB Galera HA Watchdog"
 
 # Parse command line arguments
@@ -57,6 +59,10 @@ while [[ $# -gt 0 ]]; do
             CTX="$2"
             shift 2
             ;;
+        -p|--pvc)
+            PVC="$2"
+            shift 2
+            ;;
         -d|--description)
             DESCRIPTION="$2"
             shift 2
@@ -72,7 +78,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required parameters
-if [ -z "$NS" ] || [ -z "$STS" ] || [ -z "$CTX" ]; then
+if [ -z "$NS" ] || [ -z "$STS" ] || [ -z "$CTX" ] || [ -z "$PVC" ]; then
     log_error "Missing required parameters!"
     echo ""
     usage
@@ -99,6 +105,7 @@ log_info "Configuration:"
 log_info "  Namespace:    $NS"
 log_info "  StatefulSet:  $STS"
 log_info "  Context:      $CTX"
+log_info "  PVC:          $PVC"
 log_info "  Description:  $DESCRIPTION"
 
 # Check if source files exist
@@ -130,6 +137,7 @@ sed -e "s|Description=.*|Description=$DESCRIPTION|" \
     -e "s|Environment=NS=<.*>|Environment=NS=$NS|" \
     -e "s|Environment=STS=<.*>|Environment=STS=$STS|" \
     -e "s|Environment=CTX=<.*>|Environment=CTX=$CTX|" \
+    -e "s|Environment=PVC=<.*>|Environment=PVC=$PVC|" \
     "$SERVICE_FILE" > "$TEMP_SERVICE"
 
 # Copy configured service file
@@ -171,4 +179,5 @@ else
     log_error "Service failed to start. Check logs with: journalctl -u mariadb-ha-watchdog-$NS-$STS-$CTX.service -n 50"
     exit 1
 fi
+
 

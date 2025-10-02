@@ -16,19 +16,23 @@ set -euo pipefail
 #   ./dog.sh --force     # fuerza ejecución ignorando lock
 #
 # Variables configurables (env):
-#   NS, STS, CTX, DATA_DIR, FIX_IMAGE, SLEEP_SECONDS, etc.
+#   NS, STS, CTX, DATA_DIR, FIX_IMAGE, SLEEP_SECONDS, PVC, etc.
 # =======================
 
 # ====== CONFIG =======
 NS="${NS:-nextcloud}"                             # Namespace STS
 STS="${STS:-mariadb}"                             # Nombre StatefulSet
 CTX="${CTX:-}"                                    # Contexto k8s (requerido)
-if [ -n "$CTX" ]; then
-  echo "CTX has a value: $CTX"
-else
+if [ -z "$CTX" ]; then
   echo "CTX is empty"
   exit 1
 fi
+PVC="${PVC:-}"
+if [ -z "$PVC" ]; then
+  echo "PVC is empty, it should be similar to: data-${STS}-0"
+  exit 1
+fi
+
 DATA_DIR="${DATA_DIR:-/var/lib/mysql}"            # Path volumen datos en pod
 FIX_IMAGE="${FIX_IMAGE:-tanzu-harbor.pngd.gob.pe/mef-ped-prod/mariadb:10.6}"  # Imagen fix pod
 
@@ -197,17 +201,8 @@ recovery_once(){
   scale_sts 0
   wait_delete_pods
 
-  local pvc_name
-  pvc_name=$(kubectl -n "$NS" --context="$CTX" get sts "$STS" -o jsonpath='{.spec.volumeClaimTemplates[0].metadata.name}' 2>/dev/null || echo "")
-  if [ -z "$pvc_name" ]; then
-    # fallback
-    pvc_name="data-${STS}-0"
-  else
-    pvc_name="data-${STS}-0"
-  fi
-
-  log "Creando pod temporal con PVC $pvc_name"
-  create_fix_pod "$pvc_name"
+  log "Creando pod temporal con PVC $PVC"
+  create_fix_pod "$PVC"
 
   log "Ajustando grastate.dat y limpiando archivos"
   fix_grastate
@@ -292,3 +287,4 @@ while true; do
     sleep "$SLEEP_SECONDS"
   fi
 done
+
