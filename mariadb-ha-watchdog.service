@@ -1,0 +1,27 @@
+[Unit]
+Description=MariaDB Galera HA Watchdog (<Nextcloud>)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# exporta KUBECONFIG si no está global en el entorno del servicio:
+Environment=KUBECONFIG=/home/admin/.kube/config
+# puedes ajustar variables sin editar el script:
+Environment=NS=<nextcloud>
+Environment=STS=<mariadb>
+Environment=CTX=<my-k8s-context>
+Environment=DATA_DIR=/var/lib/mysql
+Environment=SLEEP_SECONDS=30
+ExecStartPre=/bin/sh -c 'KUBECONFIG=/home/admin/.kube/config kubectl --request-timeout=5s get ns >/dev/null'
+ExecStart=/usr/local/bin/mariadb-ha-watchdog.sh
+Restart=always
+RestartSec=5
+User=admin
+# Opcional: límites y logs
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
