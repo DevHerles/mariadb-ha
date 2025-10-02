@@ -52,7 +52,7 @@ have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 # Comprobación rápida acceso API
 check_api() {
-  kubectl --request-timeout=5s version --short >/dev/null 2>&1
+  kubectl --request-timeout=5s version >/dev/null 2>&1
 }
 
 # ----- Lock handling -----
