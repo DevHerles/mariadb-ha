@@ -1,9 +1,3 @@
-
----
-
-## Script `dog.sh` comentado
-
-```bash
 #!/bin/bash
 set -euo pipefail
 
