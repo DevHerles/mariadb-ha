@@ -98,6 +98,27 @@ delete_backup_resources() {
 
     log_info "Eliminando PVC de backups (si existe)..."
     kubectl delete pvc "${DEPLOYMENT_NAME}-backup-pvc" -n "$NAMESPACE" --ignore-not-found
+    delete_pvs_for_claim "${DEPLOYMENT_NAME}-backup-pvc"
+}
+
+delete_pvs_for_claim() {
+    local claim=$1
+    if [[ -z "$claim" ]]; then
+        return
+    fi
+
+    mapfile -t pv_names < <(kubectl get pv -o jsonpath="{range .items[?(@.spec.claimRef.namespace=='$NAMESPACE' && @.spec.claimRef.name=='$claim')]}{.metadata.name}{'\n'}{end}")
+
+    if [[ ${#pv_names[@]} -eq 0 ]]; then
+        log_info "    No se encontraron PVs asociados a $claim"
+        return
+    fi
+
+    for pv in "${pv_names[@]}"; do
+        [[ -z "$pv" ]] && continue
+        log_info "    Eliminando PV asociado: $pv"
+        kubectl delete pv "$pv"
+    done
 }
 
 delete_data_pvcs() {
@@ -117,6 +138,8 @@ delete_data_pvcs() {
     for pvc in "${pvc_list[@]}"; do
         echo "  - $pvc"
         kubectl delete "$pvc" -n "$NAMESPACE"
+        local pvc_name="${pvc#persistentvolumeclaim/}"
+        delete_pvs_for_claim "$pvc_name"
     done
 }
 
