@@ -173,6 +173,16 @@ auth:
   forcePassword: true
   usePasswordFiles: false
 
+rootUser:
+  password: "$ROOT_PASSWORD"
+
+db:
+  user: "$DB_USERNAME"
+  password: "$DB_PASSWORD"
+
+replicationUser:
+  password: "$BACKUP_PASSWORD"
+
 ## Configuración de Galera Cluster
 galera:
   name: "${DEPLOYMENT_NAME}-cluster"
@@ -432,6 +442,16 @@ EOF
 # Función para instalar/actualizar Helm Chart
 deploy_mariadb() {
     log_info "Desplegando MariaDB Galera HA..."
+    local values_file="/tmp/${DEPLOYMENT_NAME}-values.yaml"
+    local -a helm_password_args=(
+        "--set-string" "auth.rootPassword=$ROOT_PASSWORD"
+        "--set-string" "auth.password=$DB_PASSWORD"
+        "--set-string" "auth.replicationPassword=$BACKUP_PASSWORD"
+        "--set-string" "galera.mariabackup.password=$BACKUP_PASSWORD"
+        "--set-string" "rootUser.password=$ROOT_PASSWORD"
+        "--set-string" "db.password=$DB_PASSWORD"
+        "--set-string" "replicationUser.password=$BACKUP_PASSWORD"
+    )
     
     # Agregar repositorio de Bitnami si no existe
     if ! helm repo list | grep -q "bitnami"; then
@@ -446,14 +466,16 @@ deploy_mariadb() {
         log_warn "Deployment existente encontrado. Actualizando..."
         helm upgrade "$DEPLOYMENT_NAME" bitnami/mariadb-galera \
             --namespace "$NAMESPACE" \
-            --values "/tmp/${DEPLOYMENT_NAME}-values.yaml" \
+            --values "$values_file" \
+            "${helm_password_args[@]}" \
             --wait \
             --timeout 10m
     else
         log_info "Instalando nuevo deployment..."
         helm install "$DEPLOYMENT_NAME" bitnami/mariadb-galera \
             --namespace "$NAMESPACE" \
-            --values "/tmp/${DEPLOYMENT_NAME}-values.yaml" \
+            --values "$values_file" \
+            "${helm_password_args[@]}" \
             --wait \
             --timeout 10m \
             --create-namespace
