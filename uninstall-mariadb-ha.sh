@@ -3,6 +3,7 @@
 ################################################################################
 # Script de Desinstalación de MariaDB Galera en Alta Disponibilidad
 # Uso: ./uninstall-mariadb-ha.sh -c config.yaml [opciones]
+# Ejemplo: ./uninstall-mariadb-ha.sh -c mariadb-config.yaml --delete-data-pvcs --delete-namespace --delete-storage-class
 ################################################################################
 
 set -e
