@@ -412,6 +412,10 @@ volumePermissions:
     pullPolicy: IfNotPresent
     pullSecrets:
       - $PULL_SECRET
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
   resources:
     requests:
       memory: "64Mi"
