@@ -13,6 +13,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+HELM_SECRET_NAME=""
+
 # Función para logging
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -55,6 +57,7 @@ parse_config() {
     # Leer variables usando yq
     DEPLOYMENT_NAME=$(yq eval '.deployment.name' "$config_file")
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
+    HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"
     CHART_VERSION=$(yq eval '.deployment.chartVersion // "latest"' "$config_file")
     
     # Storage
@@ -125,22 +128,6 @@ EOF
     log_info "✓ StorageClass creado exitosamente"
 }
 
-# Función para crear secrets
-create_secrets() {
-    log_info "Creando secrets en namespace: $NAMESPACE"
-    
-    # Secret para credenciales de MariaDB
-    kubectl create secret generic mariadb-galera-secrets \
-        --from-literal=mariadb-root-password="$ROOT_PASSWORD" \
-        --from-literal=mariadb-password="$DB_PASSWORD" \
-        --from-literal=mariadb-replication-password="$BACKUP_PASSWORD" \
-        --from-literal=mariadb-galera-mariabackup-password="$BACKUP_PASSWORD" \
-        --namespace="$NAMESPACE" \
-        --dry-run=client -o yaml | kubectl apply -f -
-    
-    log_info "✓ Secrets creados exitosamente"
-}
-
 # Función para generar values.yaml optimizado para HA
 generate_values() {
     log_info "Generando values.yaml optimizado para HA..."
@@ -175,7 +162,7 @@ auth:
   username: "$DB_USERNAME"
   password: "$DB_PASSWORD"
   database: "$DB_NAME"
-  existingSecret: "mariadb-galera-secrets"
+  replicationPassword: "$BACKUP_PASSWORD"
   forcePassword: true
   usePasswordFiles: false
 
@@ -513,7 +500,7 @@ show_connection_info() {
     done
     echo ""
     echo "Para obtener la contraseña root:"
-    echo "  kubectl get secret mariadb-galera-secrets -n $NAMESPACE -o jsonpath='{.data.mariadb-root-password}' | base64 -d"
+    echo "  kubectl get secret $HELM_SECRET_NAME -n $NAMESPACE -o jsonpath='{.data.mariadb-root-password}' | base64 -d"
     echo ""
     echo "Comando de conexión desde un pod:"
     echo "  kubectl run -it --rm mysql-client --image=mysql:8.0 --restart=Never -- \\"
@@ -559,7 +546,7 @@ spec:
             - name: MARIADB_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mariadb-galera-secrets
+                  name: $HELM_SECRET_NAME
                   key: mariadb-root-password
             - name: DEPLOYMENT_NAME
               value: "$DEPLOYMENT_NAME"
@@ -703,7 +690,7 @@ EOF
 
 # Función principal
 main() {
-    local config_file=""
+    local config_file="mariadb-config.yaml"
     
     # Parse argumentos
     while [[ $# -gt 0 ]]; do
@@ -713,10 +700,10 @@ main() {
                 shift 2
                 ;;
             -h|--help)
-                echo "Uso: $0 -c <config.yaml>"
+                echo "Uso: $0 [-c <config.yaml>]"
                 echo ""
                 echo "Opciones:"
-                echo "  -c, --config    Archivo de configuración YAML"
+                echo "  -c, --config    Archivo de configuración YAML (por defecto: mariadb-config.yaml)"
                 echo "  -h, --help      Mostrar esta ayuda"
                 exit 0
                 ;;
@@ -727,21 +714,15 @@ main() {
         esac
     done
     
-    if [[ -z "$config_file" ]]; then
-        log_error "Debe especificar un archivo de configuración con -c"
-        echo "Uso: $0 -c <config.yaml>"
-        exit 1
-    fi
-    
     log_info "═══════════════════════════════════════════════════════════"
     log_info "Iniciando Despliegue de MariaDB Galera HA"
     log_info "═══════════════════════════════════════════════════════════"
+    log_info "Usando archivo de configuración: $config_file"
     
     check_dependencies
     parse_config "$config_file"
     create_namespace
     create_storage_class
-    create_secrets
     generate_values
     deploy_mariadb
     create_backup_script

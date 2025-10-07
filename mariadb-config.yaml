@@ -16,8 +16,8 @@ storage:
   
   # Configuración NFS
   nfs:
-    server: 10.10.10.100              # IP o hostname del servidor NFS
-    path: /exports/mariadb/prod       # Path en el servidor NFS
+    server: pcmvsanfs01.pngd.gob.pe              # IP o hostname del servidor NFS
+    path: /vsanfs/PROMETHEUS       # Path en el servidor NFS
 
 # Credenciales (usar secretos seguros en producción)
 credentials:
