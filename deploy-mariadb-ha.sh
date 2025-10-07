@@ -108,6 +108,13 @@ create_namespace() {
 
 # Función para crear StorageClass NFS
 create_storage_class() {
+    log_info "Verificando StorageClass: $STORAGE_CLASS"
+    
+    if kubectl get storageclass "$STORAGE_CLASS" &> /dev/null; then
+        log_warn "StorageClass $STORAGE_CLASS ya existe, omitiendo creación"
+        return
+    fi
+
     log_info "Creando StorageClass: $STORAGE_CLASS"
     
     cat <<EOF | kubectl apply -f -
