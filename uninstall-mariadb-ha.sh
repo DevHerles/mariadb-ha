@@ -107,7 +107,8 @@ delete_pvs_for_claim() {
         return
     fi
 
-    mapfile -t pv_names < <(kubectl get pv -o jsonpath="{range .items[?(@.spec.claimRef.namespace=='$NAMESPACE' && @.spec.claimRef.name=='$claim')]}{.metadata.name}{'\n'}{end}")
+    local claim_ref="$NAMESPACE/$claim"
+    mapfile -t pv_names < <(kubectl get pv --no-headers | awk -v ref="$claim_ref" '$6 == ref {print $1}')
 
     if [[ ${#pv_names[@]} -eq 0 ]]; then
         log_info "    No se encontraron PVs asociados a $claim"
@@ -117,6 +118,23 @@ delete_pvs_for_claim() {
     for pv in "${pv_names[@]}"; do
         [[ -z "$pv" ]] && continue
         log_info "    Eliminando PV asociado: $pv"
+        kubectl delete pv "$pv"
+    done
+}
+
+delete_orphan_data_pvs() {
+    local claim_prefix="data-${DEPLOYMENT_NAME}"
+    local claim_ref_prefix="${NAMESPACE}/${claim_prefix}"
+    mapfile -t pv_names < <(kubectl get pv --no-headers | awk -v ref="$claim_ref_prefix" '$6 ~ "^" ref {print $1}')
+
+    if [[ ${#pv_names[@]} -eq 0 ]]; then
+        return
+    fi
+
+    log_info "Eliminando PVs huérfanos de datos:"
+    for pv in "${pv_names[@]}"; do
+        [[ -z "$pv" ]] && continue
+        log_info "  - PV: $pv"
         kubectl delete pv "$pv"
     done
 }
@@ -131,16 +149,17 @@ delete_data_pvcs() {
 
     if [[ ${#pvc_list[@]} -eq 0 ]]; then
         log_warn "No se encontraron PVCs de datos para eliminar."
-        return
+    else
+        log_info "Eliminando PVCs de datos:"
+        for pvc in "${pvc_list[@]}"; do
+            echo "  - $pvc"
+            kubectl delete "$pvc" -n "$NAMESPACE"
+            local pvc_name="${pvc#persistentvolumeclaim/}"
+            delete_pvs_for_claim "$pvc_name"
+        done
     fi
 
-    log_info "Eliminando PVCs de datos:"
-    for pvc in "${pvc_list[@]}"; do
-        echo "  - $pvc"
-        kubectl delete "$pvc" -n "$NAMESPACE"
-        local pvc_name="${pvc#persistentvolumeclaim/}"
-        delete_pvs_for_claim "$pvc_name"
-    done
+    delete_orphan_data_pvs
 }
 
 delete_helm_release() {
