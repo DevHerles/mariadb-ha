@@ -24,6 +24,10 @@ CLEANUP_BEFORE_DEPLOY=false
 NFS_BASE_PATH=""
 NFS_SUBPATH=""
 NFS_SHARE_PATH=""
+NFS_EFFECTIVE_SUBDIR=""
+VOLUME_PERMISSIONS_REPO="os-shell"
+VOLUME_PERMISSIONS_TAG="latest"
+DEBUG_ENABLED="false"
 
 # Función para logging
 log_info() {
@@ -120,20 +124,29 @@ parse_config() {
     STORAGE_SIZE=$(yq eval '.storage.size' "$config_file")
     NFS_SERVER=$(yq eval '.storage.nfs.server' "$config_file")
     NFS_BASE_PATH=$(yq eval '.storage.nfs.path' "$config_file")
+    if [[ -z "$NFS_BASE_PATH" || "$NFS_BASE_PATH" == "null" ]]; then
+        log_error "storage.nfs.path no está definido en $config_file"
+        exit 1
+    fi
+    NFS_BASE_PATH=${NFS_BASE_PATH%/}
     AUTO_NFS_SUBPATH=$(to_bool "$(yq eval '.storage.nfs.autoSubPath // true' "$config_file")")
     NFS_SUBPATH=$(yq eval '.storage.nfs.subPath // ""' "$config_file")
+    NFS_EFFECTIVE_SUBDIR=""
     if [[ "$AUTO_NFS_SUBPATH" == "true" ]]; then
         local auto_sub
         auto_sub=$(sanitize_name "${DEPLOYMENT_NAME}-${NAMESPACE}")
-        NFS_SHARE_PATH=$(generate_nfs_subpath "$NFS_BASE_PATH" "$auto_sub")
+        NFS_EFFECTIVE_SUBDIR="$auto_sub"
     else
         if [[ -n "$NFS_SUBPATH" && "$NFS_SUBPATH" != "null" ]]; then
             local cleaned_sub
             cleaned_sub=$(sanitize_name "$NFS_SUBPATH")
-            NFS_SHARE_PATH=$(generate_nfs_subpath "$NFS_BASE_PATH" "$cleaned_sub")
-        else
-            NFS_SHARE_PATH="$NFS_BASE_PATH"
+            NFS_EFFECTIVE_SUBDIR="$cleaned_sub"
         fi
+    fi
+    if [[ -n "$NFS_EFFECTIVE_SUBDIR" ]]; then
+        NFS_SHARE_PATH=$(generate_nfs_subpath "$NFS_BASE_PATH" "$NFS_EFFECTIVE_SUBDIR")
+    else
+        NFS_SHARE_PATH="$NFS_BASE_PATH"
     fi
     
     # Credenciales
@@ -150,6 +163,9 @@ parse_config() {
     REGISTRY_USERNAME=$(yq eval '.registry.credentials.username // ""' "$config_file")
     REGISTRY_PASSWORD=$(yq eval '.registry.credentials.password // ""' "$config_file")
     REGISTRY_EMAIL=$(yq eval '.registry.credentials.email // ""' "$config_file")
+    VOLUME_PERMISSIONS_REPO=$(yq eval '.registry.volumePermissionsRepository // "os-shell"' "$config_file")
+    VOLUME_PERMISSIONS_TAG=$(yq eval '.registry.volumePermissionsTag // "latest"' "$config_file")
+    DEBUG_ENABLED=$(to_bool "$(yq eval '.debug.enabled // false' "$config_file")")
     
     # HA Configuration
     REPLICA_COUNT=$(yq eval '.ha.replicaCount // 3' "$config_file")
@@ -258,6 +274,86 @@ cleanup_previous_storage() {
         log_warn "Eliminando StorageClass previo: $STORAGE_CLASS"
         kubectl delete storageclass "$STORAGE_CLASS"
     fi
+
+    cleanup_nfs_directory
+}
+
+cleanup_nfs_directory() {
+    if [[ "$CLEANUP_BEFORE_DEPLOY" != "true" ]]; then
+        return
+    fi
+
+    if [[ -z "$NFS_EFFECTIVE_SUBDIR" ]]; then
+        log_warn "No se definió subdirectorio NFS específico; se omite limpieza automática para evitar borrar datos compartidos."
+        return
+    fi
+
+    local cleaner_job
+    cleaner_job=$(sanitize_name "${DEPLOYMENT_NAME}-nfs-cleaner")
+
+    log_info "Limpiando directorio NFS: ${NFS_BASE_PATH}/${NFS_EFFECTIVE_SUBDIR}"
+
+    kubectl delete job "$cleaner_job" -n "$NAMESPACE" --ignore-not-found --wait=false
+
+    local cleaner_image="${IMAGE_REGISTRY}/${VOLUME_PERMISSIONS_REPO}:${VOLUME_PERMISSIONS_TAG}"
+    local image_pull_secret_block=""
+    if [[ -n "$PULL_SECRET" && "$PULL_SECRET" != "null" ]]; then
+        image_pull_secret_block=$'      imagePullSecrets:\n      - name: '"$PULL_SECRET"
+    fi
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $cleaner_job
+  namespace: $NAMESPACE
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: $DEPLOYMENT_NAME
+        app.kubernetes.io/name: nfs-cleaner
+    spec:
+      restartPolicy: Never
+$image_pull_secret_block
+      containers:
+      - name: cleaner
+        image: $cleaner_image
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          umask 002
+          TARGET_DIR="/mnt/share/$NFS_EFFECTIVE_SUBDIR"
+          mkdir -p "\$TARGET_DIR"
+          find "\$TARGET_DIR" -mindepth 1 -maxdepth 1 -print -exec rm -rf {} + || true
+          chmod 0775 "\$TARGET_DIR" || true
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          runAsNonRoot: false
+        volumeMounts:
+        - name: nfs-share
+          mountPath: /mnt/share
+        env:
+        - name: NFS_EFFECTIVE_SUBDIR
+          value: "$NFS_EFFECTIVE_SUBDIR"
+      volumes:
+      - name: nfs-share
+        nfs:
+          server: $NFS_SERVER
+          path: $NFS_BASE_PATH
+EOF
+
+    if ! kubectl wait --for=condition=complete job/"$cleaner_job" -n "$NAMESPACE" --timeout=180s; then
+        log_warn "La limpieza del NFS no completó en el tiempo esperado. Revisa el job $cleaner_job en $NAMESPACE"
+    else
+        log_info "✓ Directorio NFS limpiado correctamente"
+    fi
+
+    kubectl delete job "$cleaner_job" -n "$NAMESPACE" --ignore-not-found --wait=false
 }
 
 # Función para crear StorageClass NFS
@@ -336,6 +432,10 @@ db:
 
 replicationUser:
   password: "$BACKUP_PASSWORD"
+
+extraEnvVars:
+  - name: BITNAMI_DEBUG
+    value: "${DEBUG_ENABLED}"
 
 ## Configuración de Galera Cluster
 galera:

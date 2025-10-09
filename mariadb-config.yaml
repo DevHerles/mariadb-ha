@@ -9,6 +9,9 @@ deployment:
   namespace: database-prod            # Namespace donde se desplegará
   chartVersion: latest                # Versión del chart de Bitnami (opcional)
 
+debug:
+  enabled: true
+
 # Configuración de Storage
 storage:
   autoGenerate: true                  # Generar automáticamente un StorageClass `<deployment>-<namespace>-sc`
@@ -37,8 +40,8 @@ registry:
   pullSecret: "harbor-registry-secret"
   createPullSecret: true
   credentials:
-    username: "harbor-user"
-    password: "HarborPass123!"
+    username: "admin"
+    password: "Opd$3rt12022$.2023$"
     email: "harbor@example.com"
   repository: "mariadb-galera"
   metricsRepository: "mysqld-exporter"
