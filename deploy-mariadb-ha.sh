@@ -15,6 +15,10 @@ NC='\033[0m' # No Color
 
 HELM_SECRET_NAME=""
 AUTO_STORAGE_CLASS=true
+CREATE_PULL_SECRET=false
+REGISTRY_USERNAME=""
+REGISTRY_PASSWORD=""
+REGISTRY_EMAIL=""
 
 # Función para logging
 log_info() {
@@ -110,6 +114,10 @@ parse_config() {
     # Registry
     IMAGE_REGISTRY=$(yq eval '.registry.url' "$config_file")
     PULL_SECRET=$(yq eval '.registry.pullSecret' "$config_file")
+    CREATE_PULL_SECRET=$(to_bool "$(yq eval '.registry.createPullSecret // false' "$config_file")")
+    REGISTRY_USERNAME=$(yq eval '.registry.credentials.username // ""' "$config_file")
+    REGISTRY_PASSWORD=$(yq eval '.registry.credentials.password // ""' "$config_file")
+    REGISTRY_EMAIL=$(yq eval '.registry.credentials.email // ""' "$config_file")
     
     # HA Configuration
     REPLICA_COUNT=$(yq eval '.ha.replicaCount // 3' "$config_file")
@@ -138,6 +146,52 @@ create_namespace() {
         kubectl create namespace "$NAMESPACE"
         kubectl label namespace "$NAMESPACE" name="$NAMESPACE"
     fi
+}
+
+# Función para crear o validar pull secret
+ensure_pull_secret() {
+    if [[ -z "$PULL_SECRET" || "$PULL_SECRET" == "null" ]]; then
+        log_warn "registry.pullSecret no definido; se omitirá la creación y el chart podría fallar si requiere credenciales."
+        return
+    fi
+
+    if kubectl get secret "$PULL_SECRET" -n "$NAMESPACE" &> /dev/null; then
+        log_info "Pull secret $PULL_SECRET ya existe en $NAMESPACE"
+        return
+    fi
+
+    if [[ "$CREATE_PULL_SECRET" != "true" ]]; then
+        log_warn "Pull secret $PULL_SECRET no existe en $NAMESPACE y registry.createPullSecret=false. Asegúrate de crearlo manualmente."
+        return
+    fi
+
+    if [[ -z "$REGISTRY_USERNAME" || -z "$REGISTRY_PASSWORD" ]]; then
+        log_error "No se pueden crear credenciales de registry: username o password faltantes en registry.credentials"
+        exit 1
+    fi
+
+    local server="$IMAGE_REGISTRY"
+    # Remover repositorio específico si se proporcionó en la URL
+    if [[ "$server" == *"/"* ]]; then
+        server="${server%%/*}"
+    fi
+    server="${server#https://}"
+    server="${server#http://}"
+
+    log_info "Creando pull secret $PULL_SECRET en $NAMESPACE"
+    local -a secret_cmd=(
+        kubectl create secret docker-registry "$PULL_SECRET"
+        --namespace "$NAMESPACE"
+        --docker-server "$server"
+        --docker-username "$REGISTRY_USERNAME"
+        --docker-password "$REGISTRY_PASSWORD"
+    )
+    if [[ -n "$REGISTRY_EMAIL" && "$REGISTRY_EMAIL" != "null" ]]; then
+        secret_cmd+=(--docker-email "$REGISTRY_EMAIL")
+    fi
+    secret_cmd+=(--dry-run=client -o yaml)
+
+    "${secret_cmd[@]}" | kubectl apply -f -
 }
 
 # Función para crear StorageClass NFS
@@ -791,6 +845,7 @@ main() {
     check_dependencies
     parse_config "$config_file"
     create_namespace
+    ensure_pull_secret
     create_storage_class
     generate_values
     deploy_mariadb
