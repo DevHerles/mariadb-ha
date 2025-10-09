@@ -14,6 +14,16 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 HELM_SECRET_NAME=""
+AUTO_STORAGE_CLASS=true
+CREATE_PULL_SECRET=false
+REGISTRY_USERNAME=""
+REGISTRY_PASSWORD=""
+REGISTRY_EMAIL=""
+AUTO_NFS_SUBPATH=true
+CLEANUP_BEFORE_DEPLOY=false
+NFS_BASE_PATH=""
+NFS_SUBPATH=""
+NFS_SHARE_PATH=""
 
 # Función para logging
 log_info() {
@@ -26,6 +36,36 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+to_bool() {
+    local value="${1,,}"
+    case "$value" in
+        true|1|y|yes) echo "true" ;;
+        *) echo "false" ;;
+    esac
+}
+
+sanitize_name() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    echo "$(echo "$name" | sed 's/[^a-z0-9-]/-/g')"
+}
+
+generate_storage_class_name() {
+    local base="${DEPLOYMENT_NAME}-${NAMESPACE}-sc"
+    echo "$(sanitize_name "$base")"
+}
+
+generate_nfs_subpath() {
+    local base="$1"
+    local sub="$2"
+    base="${base%/}"
+    if [[ -z "$sub" ]]; then
+        echo "$base"
+    else
+        echo "${base}/${sub}"
+    fi
 }
 
 # Función para validar dependencias
@@ -61,10 +101,40 @@ parse_config() {
     CHART_VERSION=$(yq eval '.deployment.chartVersion // "latest"' "$config_file")
     
     # Storage
-    STORAGE_CLASS=$(yq eval '.storage.className' "$config_file")
+    AUTO_STORAGE_CLASS=$(to_bool "$(yq eval '.storage.autoGenerate // true' "$config_file")")
+    CLEANUP_BEFORE_DEPLOY=$(to_bool "$(yq eval '.storage.cleanupBeforeDeploy // false' "$config_file")")
+    local raw_storage_class
+    raw_storage_class=$(yq eval '.storage.className // ""' "$config_file")
+    if [[ "$AUTO_STORAGE_CLASS" == "true" ]]; then
+        if [[ -n "$raw_storage_class" && "$raw_storage_class" != "null" ]]; then
+            log_warn "storage.className definido pero será ignorado porque storage.autoGenerate=true"
+        fi
+        STORAGE_CLASS=$(generate_storage_class_name)
+    else
+        if [[ -z "$raw_storage_class" || "$raw_storage_class" == "null" ]]; then
+            log_error "storage.className debe definirse cuando storage.autoGenerate=false"
+            exit 1
+        fi
+        STORAGE_CLASS="$raw_storage_class"
+    fi
     STORAGE_SIZE=$(yq eval '.storage.size' "$config_file")
     NFS_SERVER=$(yq eval '.storage.nfs.server' "$config_file")
-    NFS_PATH=$(yq eval '.storage.nfs.path' "$config_file")
+    NFS_BASE_PATH=$(yq eval '.storage.nfs.path' "$config_file")
+    AUTO_NFS_SUBPATH=$(to_bool "$(yq eval '.storage.nfs.autoSubPath // true' "$config_file")")
+    NFS_SUBPATH=$(yq eval '.storage.nfs.subPath // ""' "$config_file")
+    if [[ "$AUTO_NFS_SUBPATH" == "true" ]]; then
+        local auto_sub
+        auto_sub=$(sanitize_name "${DEPLOYMENT_NAME}-${NAMESPACE}")
+        NFS_SHARE_PATH=$(generate_nfs_subpath "$NFS_BASE_PATH" "$auto_sub")
+    else
+        if [[ -n "$NFS_SUBPATH" && "$NFS_SUBPATH" != "null" ]]; then
+            local cleaned_sub
+            cleaned_sub=$(sanitize_name "$NFS_SUBPATH")
+            NFS_SHARE_PATH=$(generate_nfs_subpath "$NFS_BASE_PATH" "$cleaned_sub")
+        else
+            NFS_SHARE_PATH="$NFS_BASE_PATH"
+        fi
+    fi
     
     # Credenciales
     ROOT_PASSWORD=$(yq eval '.credentials.rootPassword' "$config_file")
@@ -76,6 +146,10 @@ parse_config() {
     # Registry
     IMAGE_REGISTRY=$(yq eval '.registry.url' "$config_file")
     PULL_SECRET=$(yq eval '.registry.pullSecret' "$config_file")
+    CREATE_PULL_SECRET=$(to_bool "$(yq eval '.registry.createPullSecret // false' "$config_file")")
+    REGISTRY_USERNAME=$(yq eval '.registry.credentials.username // ""' "$config_file")
+    REGISTRY_PASSWORD=$(yq eval '.registry.credentials.password // ""' "$config_file")
+    REGISTRY_EMAIL=$(yq eval '.registry.credentials.email // ""' "$config_file")
     
     # HA Configuration
     REPLICA_COUNT=$(yq eval '.ha.replicaCount // 3' "$config_file")
@@ -106,6 +180,86 @@ create_namespace() {
     fi
 }
 
+# Función para crear o validar pull secret
+ensure_pull_secret() {
+    if [[ -z "$PULL_SECRET" || "$PULL_SECRET" == "null" ]]; then
+        log_warn "registry.pullSecret no definido; se omitirá la creación y el chart podría fallar si requiere credenciales."
+        return
+    fi
+    
+    if kubectl get secret "$PULL_SECRET" -n "$NAMESPACE" &> /dev/null; then
+        log_info "Pull secret $PULL_SECRET ya existe en $NAMESPACE"
+        return
+    fi
+    
+    if [[ "$CREATE_PULL_SECRET" != "true" ]]; then
+        log_warn "Pull secret $PULL_SECRET no existe y registry.createPullSecret=false. Debe crearse manualmente."
+        return
+    fi
+    
+    if [[ -z "$REGISTRY_USERNAME" || -z "$REGISTRY_PASSWORD" || "$REGISTRY_USERNAME" == "null" || "$REGISTRY_PASSWORD" == "null" ]]; then
+        log_error "No se pueden crear las credenciales del registry: faltan username o password en registry.credentials."
+        exit 1
+    fi
+    
+    local server="$IMAGE_REGISTRY"
+    server="${server#https://}"
+    server="${server#http://}"
+    if [[ "$server" == *"/"* ]]; then
+        server="${server%%/*}"
+    fi
+    
+    log_info "Creando pull secret $PULL_SECRET en $NAMESPACE"
+    local -a secret_cmd=(
+        kubectl create secret docker-registry "$PULL_SECRET"
+        --namespace "$NAMESPACE"
+        --docker-server "$server"
+        --docker-username "$REGISTRY_USERNAME"
+        --docker-password "$REGISTRY_PASSWORD"
+        --dry-run=client
+        -o yaml
+    )
+    if [[ -n "$REGISTRY_EMAIL" && "$REGISTRY_EMAIL" != "null" ]]; then
+        secret_cmd+=(--docker-email "$REGISTRY_EMAIL")
+    fi
+    
+    "${secret_cmd[@]}" | kubectl apply -f -
+}
+
+cleanup_previous_storage() {
+    if [[ "$CLEANUP_BEFORE_DEPLOY" != "true" ]]; then
+        return
+    fi
+    
+    log_info "Limpiando recursos residuales antes del despliegue..."
+    
+    # Eliminar PVCs existentes del mismo deployment
+    mapfile -t existing_pvcs < <(kubectl get pvc -n "$NAMESPACE" -l app.kubernetes.io/instance="$DEPLOYMENT_NAME" -o name 2>/dev/null || true)
+    if [[ ${#existing_pvcs[@]} -gt 0 ]]; then
+        log_warn "Eliminando PVCs previos encontrados:"
+        for pvc in "${existing_pvcs[@]}"; do
+            echo "  - $pvc"
+            kubectl delete "$pvc" -n "$NAMESPACE"
+        done
+    fi
+    
+    # Eliminar PVs huérfanos que apunten al namespace/claim del deployment
+    local claim_prefix="data-${DEPLOYMENT_NAME}"
+    local claim_ref_prefix="${NAMESPACE}/${claim_prefix}"
+    mapfile -t pv_names < <(kubectl get pv --no-headers 2>/dev/null | awk -v ref="$claim_ref_prefix" '$6 ~ "^" ref {print $1}')
+    for pv in "${pv_names[@]}"; do
+        [[ -z "$pv" ]] && continue
+        log_warn "Eliminando PV huérfano: $pv"
+        kubectl delete pv "$pv"
+    done
+    
+    # Eliminar StorageClass previo si existe
+    if kubectl get storageclass "$STORAGE_CLASS" &> /dev/null; then
+        log_warn "Eliminando StorageClass previo: $STORAGE_CLASS"
+        kubectl delete storageclass "$STORAGE_CLASS"
+    fi
+}
+
 # Función para crear StorageClass NFS
 create_storage_class() {
     log_info "Verificando StorageClass: $STORAGE_CLASS"
@@ -125,7 +279,7 @@ metadata:
 provisioner: cluster.local/nfs-subdir-external-provisionerwso2
 parameters:
   server: $NFS_SERVER
-  share: $NFS_PATH
+  share: $NFS_SHARE_PATH
   mountPermissions: "0755"
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
@@ -757,6 +911,8 @@ main() {
     check_dependencies
     parse_config "$config_file"
     create_namespace
+    ensure_pull_secret
+    cleanup_previous_storage
     create_storage_class
     generate_values
     deploy_mariadb

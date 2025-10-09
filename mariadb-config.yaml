@@ -11,13 +11,17 @@ deployment:
 
 # Configuración de Storage
 storage:
-  className: mariadb-nfs-prod         # Nombre del StorageClass (debe ser único)
+  autoGenerate: true                  # Generar automáticamente un StorageClass `<deployment>-<namespace>-sc`
+  className: ""                       # Nombre personalizado (solo si autoGenerate=false)
   size: 50Gi                          # Tamaño del volumen
+  cleanupBeforeDeploy: true           # Limpiar PVC/PV/StorageClass previos antes de desplegar
   
   # Configuración NFS
   nfs:
-    server: pcmvsanfs01.pngd.gob.pe              # IP o hostname del servidor NFS
-    path: /vsanfs/PROMETHEUS       # Path en el servidor NFS
+    server: pcmvsanfs01.pngd.gob.pe   # IP o hostname del servidor NFS
+    path: /vsanfs/PROMETHEUS          # Ruta base en el servidor NFS
+    autoSubPath: true                 # Crear subdirectorio automático por deployment+namespace
+    subPath: ""                       # Subdirectorio manual (solo si autoSubPath=false)
 
 # Credenciales (usar secretos seguros en producción)
 credentials:
@@ -31,6 +35,11 @@ credentials:
 registry:
   url: "tanzu-harbor.pngd.gob.pe/pcm"
   pullSecret: "harbor-registry-secret"
+  createPullSecret: true
+  credentials:
+    username: "harbor-user"
+    password: "HarborPass123!"
+    email: "harbor@example.com"
   repository: "mariadb-galera"
   metricsRepository: "mysqld-exporter"
   volumePermissionsRepository: "os-shell"
@@ -63,4 +72,5 @@ cleanup:
   deleteDataPVCs: true                # Eliminar PVCs de datos del cluster
   deleteNamespace: false              # Eliminar namespace completo
   deleteStorageClass: true            # Eliminar StorageClass creado
+  deletePullSecret: true              # Eliminar pull secret creado automáticamente
   force: false                        # Saltar confirmación interactiva

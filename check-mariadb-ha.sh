@@ -20,10 +20,30 @@ STORAGE_CLASS=""
 REPLICA_COUNT=""
 ROOT_PASSWORD=""
 HELM_SECRET_NAME=""
+AUTO_STORAGE_CLASS=true
 
 ERROR_COUNT=0
 WARN_COUNT=0
 declare -a POD_LIST=()
+
+to_bool() {
+    local value="${1,,}"
+    case "$value" in
+        true|1|y|yes) echo "true" ;;
+        *) echo "false" ;;
+    esac
+}
+
+sanitize_name() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    echo "$(echo "$name" | sed 's/[^a-z0-9-]/-/g')"
+}
+
+generate_storage_class_name() {
+    local base="${DEPLOYMENT_NAME}-${NAMESPACE}-sc"
+    echo "$(sanitize_name "$base")"
+}
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -65,7 +85,14 @@ parse_config() {
 
     DEPLOYMENT_NAME=$(yq eval '.deployment.name' "$config_file")
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
-    STORAGE_CLASS=$(yq eval '.storage.className' "$config_file")
+    AUTO_STORAGE_CLASS=$(to_bool "$(yq eval '.storage.autoGenerate // true' "$config_file")")
+    local raw_storage_class
+    raw_storage_class=$(yq eval '.storage.className // ""' "$config_file")
+    if [[ "$AUTO_STORAGE_CLASS" == "true" ]]; then
+        STORAGE_CLASS=$(generate_storage_class_name)
+    else
+        STORAGE_CLASS="$raw_storage_class"
+    fi
     REPLICA_COUNT=$(yq eval '.ha.replicaCount // "null"' "$config_file")
     ROOT_PASSWORD=$(yq eval '.credentials.rootPassword // ""' "$config_file")
     HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"

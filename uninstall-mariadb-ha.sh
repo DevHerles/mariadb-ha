@@ -19,11 +19,15 @@ DELETE_NAMESPACE=false
 DELETE_STORAGE_CLASS=false
 DELETE_DATA_PVCS=false
 FORCE=false
+AUTO_STORAGE_CLASS=true
+DELETE_PULL_SECRET=false
+PULL_SECRET=""
 # Indicadores de override por CLI
 CLI_DELETE_NAMESPACE_SET=false
 CLI_DELETE_STORAGE_CLASS_SET=false
 CLI_DELETE_DATA_PVCS_SET=false
 CLI_FORCE_SET=false
+CLI_DELETE_PULL_SECRET_SET=false
 
 # Variables globales cargadas desde el config
 DEPLOYMENT_NAME=""
@@ -37,6 +41,17 @@ to_bool() {
         true|1|y|yes) echo "true" ;;
         *) echo "false" ;;
     esac
+}
+
+sanitize_name() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    echo "$(echo "$name" | sed 's/[^a-z0-9-]/-/g')"
+}
+
+generate_storage_class_name() {
+    local base="${DEPLOYMENT_NAME}-${NAMESPACE}-sc"
+    echo "$(sanitize_name "$base")"
 }
 
 log_info() {
@@ -77,8 +92,26 @@ parse_config() {
 
     DEPLOYMENT_NAME=$(yq eval '.deployment.name' "$config_file")
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
-    STORAGE_CLASS=$(yq eval '.storage.className' "$config_file")
+    AUTO_STORAGE_CLASS=$(to_bool "$(yq eval '.storage.autoGenerate // true' "$config_file")")
+
+    local raw_storage_class
+    raw_storage_class=$(yq eval '.storage.className // ""' "$config_file")
+
+    if [[ "$AUTO_STORAGE_CLASS" == "true" ]]; then
+        if [[ -n "$raw_storage_class" && "$raw_storage_class" != "null" ]]; then
+            log_warn "storage.className definido pero será ignorado porque storage.autoGenerate=true"
+        fi
+        STORAGE_CLASS=$(generate_storage_class_name)
+    else
+        if [[ -z "$raw_storage_class" || "$raw_storage_class" == "null" ]]; then
+            log_error "storage.className debe definirse cuando storage.autoGenerate=false"
+            exit 1
+        fi
+        STORAGE_CLASS="$raw_storage_class"
+    fi
+
     HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"
+    PULL_SECRET=$(yq eval '.registry.pullSecret // ""' "$config_file")
 
     if [[ -z "$DEPLOYMENT_NAME" || "$DEPLOYMENT_NAME" == "null" ]]; then
         log_error "deployment.name no está definido en $config_file"
@@ -95,10 +128,11 @@ parse_config() {
         exit 1
     fi
 
-    local cfg_delete_namespace cfg_delete_storage_class cfg_delete_data_pvcs cfg_force
+    local cfg_delete_namespace cfg_delete_storage_class cfg_delete_data_pvcs cfg_delete_pull_secret cfg_force
     cfg_delete_namespace=$(yq eval '.cleanup.deleteNamespace // false' "$config_file")
     cfg_delete_storage_class=$(yq eval '.cleanup.deleteStorageClass // false' "$config_file")
     cfg_delete_data_pvcs=$(yq eval '.cleanup.deleteDataPVCs // false' "$config_file")
+    cfg_delete_pull_secret=$(yq eval '.cleanup.deletePullSecret // false' "$config_file")
     cfg_force=$(yq eval '.cleanup.force // false' "$config_file")
 
     if [[ "$CLI_DELETE_NAMESPACE_SET" != "true" ]]; then
@@ -113,6 +147,10 @@ parse_config() {
         DELETE_DATA_PVCS=$(to_bool "$cfg_delete_data_pvcs")
     fi
 
+    if [[ "$CLI_DELETE_PULL_SECRET_SET" != "true" ]]; then
+        DELETE_PULL_SECRET=$(to_bool "$cfg_delete_pull_secret")
+    fi
+
     if [[ "$CLI_FORCE_SET" != "true" ]]; then
         FORCE=$(to_bool "$cfg_force")
     fi
@@ -122,6 +160,7 @@ parse_config() {
     log_info "  Namespace: $NAMESPACE"
     log_info "  StorageClass: $STORAGE_CLASS"
     log_info "  Eliminar PVCs de datos: $DELETE_DATA_PVCS"
+    log_info "  Eliminar pull secret: $DELETE_PULL_SECRET"
     log_info "  Eliminar namespace: $DELETE_NAMESPACE"
     log_info "  Eliminar StorageClass: $DELETE_STORAGE_CLASS"
     log_info "  Forzar (sin confirmación): $FORCE"
@@ -236,6 +275,19 @@ delete_secret() {
     kubectl delete secret "$HELM_SECRET_NAME" -n "$NAMESPACE" --ignore-not-found
 }
 
+delete_pull_secret() {
+    if [[ "$DELETE_PULL_SECRET" != "true" ]]; then
+        return
+    fi
+
+    if [[ -z "$PULL_SECRET" || "$PULL_SECRET" == "null" ]]; then
+        log_warn "No se pudo determinar el pull secret desde la configuración. Se omite la eliminación."
+        return
+    fi
+
+    log_info "Eliminando pull secret (si existe): $PULL_SECRET"
+    kubectl delete secret "$PULL_SECRET" -n "$NAMESPACE" --ignore-not-found
+}
 delete_storage_class() {
     if [[ "$DELETE_STORAGE_CLASS" != "true" ]]; then
         return
@@ -268,6 +320,7 @@ Opciones:
       --delete-data-pvcs    Eliminar PVCs de datos creados por la release
       --delete-namespace    Eliminar el namespace completo una vez desinstalado
       --delete-storage-class Eliminar el StorageClass definido en el config
+      --delete-pull-secret  Eliminar el pull secret definido en registry.pullSecret
   -f, --force               No solicitar confirmación interactiva
   -h, --help                Mostrar esta ayuda
 EOF
@@ -295,6 +348,11 @@ main() {
             --delete-storage-class)
                 DELETE_STORAGE_CLASS=true
                 CLI_DELETE_STORAGE_CLASS_SET=true
+                shift
+                ;;
+            --delete-pull-secret)
+                DELETE_PULL_SECRET=true
+                CLI_DELETE_PULL_SECRET_SET=true
                 shift
                 ;;
             -f|--force)
@@ -326,6 +384,7 @@ main() {
     delete_helm_release
     delete_data_pvcs
     delete_secret
+    delete_pull_secret
     delete_storage_class
     delete_namespace
 
