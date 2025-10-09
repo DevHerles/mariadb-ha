@@ -153,7 +153,7 @@ global:
   imagePullSecrets:
     - $PULL_SECRET
   security:
-    allowInsecureImages: true. 
+    allowInsecureImages: true
 
 image:
   registry: $IMAGE_REGISTRY
