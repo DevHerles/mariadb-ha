@@ -19,12 +19,25 @@ DELETE_NAMESPACE=false
 DELETE_STORAGE_CLASS=false
 DELETE_DATA_PVCS=false
 FORCE=false
+# Indicadores de override por CLI
+CLI_DELETE_NAMESPACE_SET=false
+CLI_DELETE_STORAGE_CLASS_SET=false
+CLI_DELETE_DATA_PVCS_SET=false
+CLI_FORCE_SET=false
 
 # Variables globales cargadas desde el config
 DEPLOYMENT_NAME=""
 NAMESPACE=""
 STORAGE_CLASS=""
 HELM_SECRET_NAME=""
+
+to_bool() {
+    local value="${1,,}"
+    case "$value" in
+        true|1|y|yes) echo "true" ;;
+        *) echo "false" ;;
+    esac
+}
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -66,6 +79,52 @@ parse_config() {
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
     STORAGE_CLASS=$(yq eval '.storage.className' "$config_file")
     HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"
+
+    if [[ -z "$DEPLOYMENT_NAME" || "$DEPLOYMENT_NAME" == "null" ]]; then
+        log_error "deployment.name no está definido en $config_file"
+        exit 1
+    fi
+
+    if [[ -z "$NAMESPACE" || "$NAMESPACE" == "null" ]]; then
+        log_error "deployment.namespace no está definido en $config_file"
+        exit 1
+    fi
+
+    if [[ -z "$STORAGE_CLASS" || "$STORAGE_CLASS" == "null" ]]; then
+        log_error "storage.className no está definido en $config_file"
+        exit 1
+    fi
+
+    local cfg_delete_namespace cfg_delete_storage_class cfg_delete_data_pvcs cfg_force
+    cfg_delete_namespace=$(yq eval '.cleanup.deleteNamespace // false' "$config_file")
+    cfg_delete_storage_class=$(yq eval '.cleanup.deleteStorageClass // false' "$config_file")
+    cfg_delete_data_pvcs=$(yq eval '.cleanup.deleteDataPVCs // false' "$config_file")
+    cfg_force=$(yq eval '.cleanup.force // false' "$config_file")
+
+    if [[ "$CLI_DELETE_NAMESPACE_SET" != "true" ]]; then
+        DELETE_NAMESPACE=$(to_bool "$cfg_delete_namespace")
+    fi
+
+    if [[ "$CLI_DELETE_STORAGE_CLASS_SET" != "true" ]]; then
+        DELETE_STORAGE_CLASS=$(to_bool "$cfg_delete_storage_class")
+    fi
+
+    if [[ "$CLI_DELETE_DATA_PVCS_SET" != "true" ]]; then
+        DELETE_DATA_PVCS=$(to_bool "$cfg_delete_data_pvcs")
+    fi
+
+    if [[ "$CLI_FORCE_SET" != "true" ]]; then
+        FORCE=$(to_bool "$cfg_force")
+    fi
+
+    log_info "Parámetros cargados:"
+    log_info "  Deployment: $DEPLOYMENT_NAME"
+    log_info "  Namespace: $NAMESPACE"
+    log_info "  StorageClass: $STORAGE_CLASS"
+    log_info "  Eliminar PVCs de datos: $DELETE_DATA_PVCS"
+    log_info "  Eliminar namespace: $DELETE_NAMESPACE"
+    log_info "  Eliminar StorageClass: $DELETE_STORAGE_CLASS"
+    log_info "  Forzar (sin confirmación): $FORCE"
 }
 
 confirm_action() {
@@ -225,18 +284,22 @@ main() {
                 ;;
             --delete-data-pvcs)
                 DELETE_DATA_PVCS=true
+                CLI_DELETE_DATA_PVCS_SET=true
                 shift
                 ;;
             --delete-namespace)
                 DELETE_NAMESPACE=true
+                CLI_DELETE_NAMESPACE_SET=true
                 shift
                 ;;
             --delete-storage-class)
                 DELETE_STORAGE_CLASS=true
+                CLI_DELETE_STORAGE_CLASS_SET=true
                 shift
                 ;;
             -f|--force)
                 FORCE=true
+                CLI_FORCE_SET=true
                 shift
                 ;;
             -h|--help)

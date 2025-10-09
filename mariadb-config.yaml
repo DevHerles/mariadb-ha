@@ -57,3 +57,10 @@ backup:
   enabled: true                       # Habilitar backups automáticos
   schedule: "0 2 * * *"               # Cron schedule (2 AM diario)
   retention: 7                        # Días de retención de backups
+
+# Opciones de limpieza para uninstall-mariadb-ha.sh
+cleanup:
+  deleteDataPVCs: true                # Eliminar PVCs de datos del cluster
+  deleteNamespace: false              # Eliminar namespace completo
+  deleteStorageClass: true            # Eliminar StorageClass creado
+  force: false                        # Saltar confirmación interactiva
