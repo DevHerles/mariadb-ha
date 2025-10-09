@@ -16,7 +16,46 @@ helm repo update
     --set nfs.mountOptions={vers=4.1} 
 ```
 
-2. Install mariadb in high availability mode
+## Despliegue recomendado (Helm + script)
+
+1. Ajusta `mariadb-config.yaml` con tus parámetros (namespace, credenciales, storage, registry).
+2. Ejecuta el script limpio de despliegue:
+
+```bash
+./deploy-mariadb-ha-v2.sh            # usa mariadb-config.yaml por defecto
+# o
+./deploy-mariadb-ha-v2.sh -c otro-config.yaml
+```
+
+El script creará/actualizará el secreto de credenciales, generará un `values.yaml` temporal y lanzará `helm upgrade --install` para `bitnami/mariadb-galera`. Al finalizar mostrará el estado y cómo obtener la contraseña.
+
+3. Para desinstalar y limpiar PVC/PV en caso de reinstalación completa:
+
+```bash
+./uninstall-mariadb-ha.sh --delete-data-pvcs --force
+```
+
+El script eliminará la release, los PVC y los PV huérfanos asociados. Añade `--delete-namespace` o `--delete-storage-class` si necesitas borrar esos recursos también.
+
+---
+
+### Campos relevantes en `mariadb-config.yaml`
+
+```yaml
+registry:
+  url: "tanzu-harbor.pngd.gob.pe/pcm"            # Host (puede incluir prefijo de proyecto)
+  pullSecret: "harbor-registry-secret"
+  repository: "mariadb-galera"                   # Repositorio de la imagen principal (ej: mef/mariadb-galera)
+  tag: "12.0.2-debian-12-r0"
+  metricsRepository: "mysqld-exporter"           # Opcional: repositorio para el exporter
+  metricsTag: "0.17.2-debian-12-r16"
+  volumePermissionsRepository: "os-shell"        # Opcional: repositorio para el init de permisos
+  volumePermissionsTag: "12-debian-12-r36"
+```
+
+---
+
+2. Install mariadb in high availability mode (YAML estático legado)
 ```bash
 kubectl apply -f mariadb.yaml -n mariadb
 ```

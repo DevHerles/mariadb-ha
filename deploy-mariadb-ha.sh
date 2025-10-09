@@ -386,12 +386,14 @@ config: |
 podSecurityContext:
   enabled: true
   fsGroup: 1001
+  runAsGroup: 1001
   runAsUser: 1001
   runAsNonRoot: true
 
 containerSecurityContext:
   enabled: true
   runAsUser: 1001
+  runAsGroup: 1001
   runAsNonRoot: true
   allowPrivilegeEscalation: false
   capabilities:
