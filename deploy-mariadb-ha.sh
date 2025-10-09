@@ -14,6 +14,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 HELM_SECRET_NAME=""
+AUTO_STORAGE_CLASS=true
 
 # Función para logging
 log_info() {
@@ -26,6 +27,25 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+to_bool() {
+    local value="${1,,}"
+    case "$value" in
+        true|1|y|yes) echo "true" ;;
+        *) echo "false" ;;
+    esac
+}
+
+sanitize_name() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    echo "$(echo "$name" | sed 's/[^a-z0-9-]/-/g')"
+}
+
+generate_storage_class_name() {
+    local base="${DEPLOYMENT_NAME}-${NAMESPACE}-sc"
+    echo "$(sanitize_name "$base")"
 }
 
 # Función para validar dependencias
@@ -59,9 +79,23 @@ parse_config() {
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
     HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"
     CHART_VERSION=$(yq eval '.deployment.chartVersion // "latest"' "$config_file")
+    AUTO_STORAGE_CLASS=$(to_bool "$(yq eval '.storage.autoGenerate // true' "$config_file")")
     
     # Storage
-    STORAGE_CLASS=$(yq eval '.storage.className' "$config_file")
+    local raw_storage_class
+    raw_storage_class=$(yq eval '.storage.className // ""' "$config_file")
+    if [[ "$AUTO_STORAGE_CLASS" == "true" ]]; then
+        if [[ -n "$raw_storage_class" && "$raw_storage_class" != "null" ]]; then
+            log_warn "storage.className definido pero será ignorado porque storage.autoGenerate=true"
+        fi
+        STORAGE_CLASS=$(generate_storage_class_name)
+    else
+        if [[ -z "$raw_storage_class" || "$raw_storage_class" == "null" ]]; then
+            log_error "storage.className debe definirse cuando storage.autoGenerate=false"
+            exit 1
+        fi
+        STORAGE_CLASS="$raw_storage_class"
+    fi
     STORAGE_SIZE=$(yq eval '.storage.size' "$config_file")
     NFS_SERVER=$(yq eval '.storage.nfs.server' "$config_file")
     NFS_PATH=$(yq eval '.storage.nfs.path' "$config_file")

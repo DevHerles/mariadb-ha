@@ -11,7 +11,8 @@ deployment:
 
 # Configuración de Storage
 storage:
-  className: mariadb-nfs-prod         # Nombre del StorageClass (debe ser único)
+  autoGenerate: true                  # Generar automáticamente un StorageClass `${deployment.name}-${namespace}-sc`
+  className: ""                       # Nombre personalizado (solo se usa si autoGenerate=false)
   size: 50Gi                          # Tamaño del volumen
   
   # Configuración NFS
