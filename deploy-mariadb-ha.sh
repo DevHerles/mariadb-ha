@@ -666,6 +666,127 @@ EOF
     log_info "✓ CronJob de backup creado"
 }
 
+# Función para verificar y crear el provisioner NFS si no existe
+create_nfs_provisioner() {
+    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
+    local nfs_server="$NFS_SERVER"
+    local nfs_path="$NFS_PATH"
+    
+    log_info "Verificando provisioner NFS: $provisioner_name"
+    
+    # Verificar si el provisioner ya existe
+    if kubectl get deployment "nfs-${DEPLOYMENT_NAME}-provisioner" -n infra &> /dev/null; then
+        log_warn "Provisioner NFS ya existe: nfs-${DEPLOYMENT_NAME}-provisioner"
+        return 0
+    fi
+    
+    log_info "Creando nuevo provisioner NFS para el cluster..."
+    
+    # Crear el provisioner
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-${DEPLOYMENT_NAME}-provisioner
+  namespace: infra
+  labels:
+    app: nfs-subdir-external-provisioner
+    release: nfs-${DEPLOYMENT_NAME}-provisioner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-subdir-external-provisioner
+      release: nfs-${DEPLOYMENT_NAME}-provisioner
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nfs-subdir-external-provisioner
+        release: nfs-${DEPLOYMENT_NAME}-provisioner
+    spec:
+      serviceAccountName: nfs-subdir-external-provisionerwso2
+      containers:
+      - env:
+        - name: PROVISIONER_NAME
+          value: ${provisioner_name}
+        - name: NFS_SERVER
+          value: ${nfs_server}
+        - name: NFS_PATH
+          value: ${nfs_path}
+        image: tanzu-harbor.pngd.gob.pe/deploy/nfs-subdir-external-provisioner:v4.0.2
+        imagePullPolicy: IfNotPresent
+        name: nfs-subdir-external-provisioner
+        resources: 
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext: {}
+        volumeMounts:
+        - mountPath: /persistentvolumes
+          name: nfs-subdir-external-provisioner-root
+      volumes:
+      - name: nfs-subdir-external-provisioner-root
+        nfs:
+          path: ${nfs_path}
+          server: ${nfs_server}
+EOF
+
+    # Esperar a que el provisioner esté listo
+    log_info "Esperando a que el provisioner esté ready..."
+    kubectl wait --for=condition=ready pod \
+        -l release=nfs-${DEPLOYMENT_NAME}-provisioner \
+        -n infra \
+        --timeout=120s
+    
+    log_info "✓ Provisioner NFS creado exitosamente: ${provisioner_name}"
+}
+
+# Función para crear StorageClass con el provisioner específico del cluster
+create_storage_class() {
+    local storage_class="$STORAGE_CLASS"
+    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
+    
+    log_info "Verificando StorageClass: $storage_class"
+    
+    if kubectl get storageclass "$storage_class" &> /dev/null; then
+        log_warn "StorageClass $storage_class ya existe"
+        
+        # Verificar si usa el provisioner correcto
+        local current_provisioner=$(kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}')
+        if [[ "$current_provisioner" != "$provisioner_name" ]]; then
+            log_warn "StorageClass usa provisioner diferente: $current_provisioner"
+            log_info "Actualizando StorageClass para usar: $provisioner_name"
+            kubectl delete storageclass "$storage_class"
+        else
+            log_info "StorageClass ya usa el provisioner correcto"
+            return 0
+        fi
+    fi
+
+    log_info "Creando StorageClass: $storage_class con provisioner: $provisioner_name"
+    
+    cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: $storage_class
+provisioner: $provisioner_name
+parameters:
+  mountPermissions: "0777"
+  mountOptions: "nfsvers=3,tcp,timeo=600,retrans=2"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+EOF
+    
+    log_info "✓ StorageClass creado exitosamente con provisioner específico del cluster"
+}
+
 # Función principal
 main() {
     local config_file="mariadb-config.yaml"
@@ -700,6 +821,7 @@ main() {
     check_dependencies
     parse_config "$config_file"
     create_namespace
+    create_nfs_provisioner
     create_storage_class
     generate_values
     deploy_mariadb
@@ -714,4 +836,5 @@ main() {
 
 # Ejecutar
 main "$@"
+
 
