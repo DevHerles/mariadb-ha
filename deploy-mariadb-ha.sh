@@ -1,8 +1,9 @@
 #!/bin/bash
 
 ################################################################################
-# Script de Despliegue Dinámico de MariaDB Galera en Alta Disponibilidad
-# Uso: ./deploy-mariadb-ha.sh -c config.yaml
+# Script de Despliegue Automático de MariaDB Galera con Bootstrap Inteligente
+# Detecta automáticamente si es primer despliegue y configura bootstrap
+# Uso: ./deploy-mariadb-ha-auto.sh -c config.yaml
 ################################################################################
 
 set -e
@@ -11,11 +12,17 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 HELM_SECRET_NAME=""
 DEBUG_ENABLED="false"
 GALERA_ENABLED=true
+GALERA_FORCE_BOOTSTRAP="false"
+GALERA_BOOTSTRAP_NODE=""
+GALERA_FORCE_SAFE_BOOTSTRAP="false"
+HELM_RELEASE_EXISTS="false"
+IS_FIRST_DEPLOYMENT="false"
 
 # Función para logging
 log_info() {
@@ -28,6 +35,10 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $1"
 }
 
 to_bool() {
@@ -51,6 +62,57 @@ check_dependencies() {
     done
     
     log_info "✓ Todas las dependencias están instaladas"
+}
+
+# Función para detectar si es primer despliegue
+detect_first_deployment() {
+    log_info "Detectando estado del cluster..."
+    
+    # Verificar si existe el release de Helm
+    if helm status "$DEPLOYMENT_NAME" -n "$NAMESPACE" &> /dev/null; then
+        HELM_RELEASE_EXISTS="true"
+        log_debug "Release Helm encontrado: $DEPLOYMENT_NAME"
+    else
+        HELM_RELEASE_EXISTS="false"
+        log_debug "Release Helm no encontrado"
+    fi
+    
+    # Verificar si existen PVCs con datos
+    local pvc_count=$(kubectl get pvc -n "$NAMESPACE" \
+        -l app.kubernetes.io/instance="$DEPLOYMENT_NAME" \
+        --ignore-not-found 2>/dev/null | grep -c "data-" || echo "0")
+    
+    log_debug "PVCs de datos encontrados: $pvc_count"
+    
+    # Verificar si existen pods
+    local pod_count=$(kubectl get pods -n "$NAMESPACE" \
+        -l app.kubernetes.io/instance="$DEPLOYMENT_NAME" \
+        --ignore-not-found 2>/dev/null | grep -c "mariadb-galera" || echo "0")
+    
+    log_debug "Pods encontrados: $pod_count"
+    
+    # Verificar si existe un ConfigMap de estado
+    local state_cm="${DEPLOYMENT_NAME}-galera-state"
+    local cluster_initialized="false"
+    
+    if kubectl get configmap "$state_cm" -n "$NAMESPACE" &> /dev/null; then
+        cluster_initialized=$(kubectl get configmap "$state_cm" -n "$NAMESPACE" \
+            -o jsonpath='{.data.cluster_initialized}' 2>/dev/null || echo "false")
+        log_debug "ConfigMap de estado encontrado. cluster_initialized=$cluster_initialized"
+    else
+        log_debug "ConfigMap de estado no encontrado"
+    fi
+    
+    # Lógica de detección
+    if [[ "$HELM_RELEASE_EXISTS" == "false" ]] && [[ "$pvc_count" == "0" ]] && [[ "$cluster_initialized" == "false" ]]; then
+        IS_FIRST_DEPLOYMENT="true"
+        log_info "🆕 PRIMER DESPLIEGUE detectado"
+        log_info "   → Bootstrap automático será habilitado"
+    else
+        IS_FIRST_DEPLOYMENT="false"
+        log_info "♻️  DESPLIEGUE EXISTENTE detectado"
+        log_info "   → Bootstrap automático será deshabilitado"
+    fi
 }
 
 # Función para parsear el archivo de configuración
@@ -105,6 +167,26 @@ parse_config() {
     BACKUP_RETENTION=$(yq eval '.backup.retention // 7' "$config_file")
 }
 
+# Función para configurar bootstrap automático
+configure_bootstrap() {
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        log_info "Configurando bootstrap para primer despliegue..."
+        GALERA_FORCE_BOOTSTRAP="true"
+        GALERA_BOOTSTRAP_NODE="0"
+        GALERA_FORCE_SAFE_BOOTSTRAP="true"
+        log_info "  ✓ forceBootstrap: true"
+        log_info "  ✓ bootstrapFromNode: 0"
+        log_info "  ✓ forceSafeToBootstrap: true"
+    else
+        log_info "Configurando para cluster existente..."
+        GALERA_FORCE_BOOTSTRAP="false"
+        GALERA_BOOTSTRAP_NODE=""
+        GALERA_FORCE_SAFE_BOOTSTRAP="false"
+        log_info "  ✓ forceBootstrap: false"
+        log_info "  ✓ Configuración normal de HA"
+    fi
+}
+
 # Función para crear namespace
 create_namespace() {
     log_info "Verificando namespace: $NAMESPACE"
@@ -118,27 +200,139 @@ create_namespace() {
     fi
 }
 
-# Función para crear StorageClass NFS
-create_storage_class() {
-    log_info "Verificando StorageClass: $STORAGE_CLASS"
+# Función para crear o actualizar ConfigMap de estado
+create_state_configmap() {
+    local state_cm="${DEPLOYMENT_NAME}-galera-state"
     
-    if kubectl get storageclass "$STORAGE_CLASS" &> /dev/null; then
-        log_warn "StorageClass $STORAGE_CLASS ya existe, omitiendo creación"
-        return
+    log_info "Creando ConfigMap de estado del cluster..."
+    
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $state_cm
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/instance: $DEPLOYMENT_NAME
+    app.kubernetes.io/component: galera-state
+data:
+  cluster_initialized: "true"
+  first_deployment_date: "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  last_update_date: "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  deployment_count: "1"
+EOF
+    
+    log_info "✓ ConfigMap de estado creado"
+}
+
+# Función para verificar y crear el provisioner NFS si no existe
+create_nfs_provisioner() {
+    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
+    local nfs_server="$NFS_SERVER"
+    local nfs_path="$NFS_PATH"
+    
+    log_info "Verificando provisioner NFS: $provisioner_name"
+    
+    if kubectl get deployment "nfs-${DEPLOYMENT_NAME}-provisioner" -n infra &> /dev/null; then
+        log_warn "Provisioner NFS ya existe: nfs-${DEPLOYMENT_NAME}-provisioner"
+        return 0
+    fi
+    
+    log_info "Creando nuevo provisioner NFS para el cluster..."
+    
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-${DEPLOYMENT_NAME}-provisioner
+  namespace: infra
+  labels:
+    app: nfs-subdir-external-provisioner
+    release: nfs-${DEPLOYMENT_NAME}-provisioner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-subdir-external-provisioner
+      release: nfs-${DEPLOYMENT_NAME}-provisioner
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nfs-subdir-external-provisioner
+        release: nfs-${DEPLOYMENT_NAME}-provisioner
+    spec:
+      serviceAccountName: nfs-subdir-external-provisionerwso2
+      containers:
+      - env:
+        - name: PROVISIONER_NAME
+          value: ${provisioner_name}
+        - name: NFS_SERVER
+          value: ${nfs_server}
+        - name: NFS_PATH
+          value: ${nfs_path}
+        image: tanzu-harbor.pngd.gob.pe/deploy/nfs-subdir-external-provisioner:v4.0.2
+        imagePullPolicy: IfNotPresent
+        name: nfs-subdir-external-provisioner
+        resources: 
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext: {}
+        volumeMounts:
+        - mountPath: /persistentvolumes
+          name: nfs-subdir-external-provisioner-root
+      volumes:
+      - name: nfs-subdir-external-provisioner-root
+        nfs:
+          path: ${nfs_path}
+          server: ${nfs_server}
+EOF
+
+    log_info "Esperando a que el provisioner esté ready..."
+    kubectl wait --for=condition=ready pod \
+        -l release=nfs-${DEPLOYMENT_NAME}-provisioner \
+        -n infra \
+        --timeout=120s
+    
+    log_info "✓ Provisioner NFS creado exitosamente: ${provisioner_name}"
+}
+
+# Función para crear StorageClass
+create_storage_class() {
+    local storage_class="$STORAGE_CLASS"
+    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
+    
+    log_info "Verificando StorageClass: $storage_class"
+    
+    if kubectl get storageclass "$storage_class" &> /dev/null; then
+        log_warn "StorageClass $storage_class ya existe"
+        local current_provisioner=$(kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}')
+        if [[ "$current_provisioner" != "$provisioner_name" ]]; then
+            log_warn "StorageClass usa provisioner diferente: $current_provisioner"
+            log_info "Actualizando StorageClass para usar: $provisioner_name"
+            kubectl delete storageclass "$storage_class"
+        else
+            log_info "StorageClass ya usa el provisioner correcto"
+            return 0
+        fi
     fi
 
-    log_info "Creando StorageClass: $STORAGE_CLASS"
+    log_info "Creando StorageClass: $storage_class con provisioner: $provisioner_name"
     
     cat <<EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: $STORAGE_CLASS
-provisioner: cluster.local/nfs-subdir-external-provisionerwso2
+  name: $storage_class
+provisioner: $provisioner_name
 parameters:
-  server: $NFS_SERVER
-  share: $NFS_PATH
-  mountPermissions: "0755"
+  mountPermissions: "0777"
+  mountOptions: "nfsvers=3,tcp,timeo=600,retrans=2"
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
@@ -147,15 +341,16 @@ EOF
     log_info "✓ StorageClass creado exitosamente"
 }
 
-# Función para generar values.yaml optimizado para HA
+# Función para generar values.yaml con bootstrap automático
 generate_values() {
     log_info "Generando values.yaml optimizado para HA..."
     
     cat > "/tmp/${DEPLOYMENT_NAME}-values.yaml" <<EOF
 ################################################################################
-# MariaDB Galera HA Configuration
+# MariaDB Galera HA Configuration - Auto Bootstrap
 # Deployment: $DEPLOYMENT_NAME
 # Namespace: $NAMESPACE
+# First Deployment: $IS_FIRST_DEPLOYMENT
 # Generated: $(date)
 ################################################################################
 
@@ -205,22 +400,31 @@ primary:
     - name: NAMI_DEBUG
       value: "--log-level trace"
 
-## Configuración de Galera Cluster
+## Configuración de Galera Cluster con Bootstrap Automático
 galera:
   enabled: $GALERA_ENABLED
   name: "${DEPLOYMENT_NAME}-cluster"
-  
+$(if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+    cat <<BOOTSTRAP_CONFIG
   bootstrap:
     bootstrapFromNode: 0
-    forceSafeToBootstrap: false
-  
-  mariabackup:
-    user: mariadbbackup
-    password: "$BACKUP_PASSWORD"
+    forceSafeToBootstrap: true
   
   cluster:
     name: "${DEPLOYMENT_NAME}-cluster"
     bootstrap: true
+BOOTSTRAP_CONFIG
+else
+    cat <<NORMAL_CONFIG
+  cluster:
+    name: "${DEPLOYMENT_NAME}-cluster"
+    bootstrap: false
+NORMAL_CONFIG
+fi)
+  
+  mariabackup:
+    user: mariadbbackup
+    password: "$BACKUP_PASSWORD"
   
   extraFlags: |
     --wsrep_slave_threads=4
@@ -277,9 +481,9 @@ podDisruptionBudget:
   minAvailable: $MIN_AVAILABLE
   maxUnavailable: null
 
-## Probes (temporalmente deshabilitadas para debug)
+## Probes
 livenessProbe:
-  enabled: false
+  enabled: true
   initialDelaySeconds: 120
   periodSeconds: 10
   timeoutSeconds: 5
@@ -287,7 +491,7 @@ livenessProbe:
   failureThreshold: 3
 
 readinessProbe:
-  enabled: false
+  enabled: true
   initialDelaySeconds: 30
   periodSeconds: 10
   timeoutSeconds: 5
@@ -295,7 +499,12 @@ readinessProbe:
   failureThreshold: 3
 
 startupProbe:
-  enabled: false
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 30
 
 ## Service
 service:
@@ -382,6 +591,12 @@ volumePermissions:
 EOF
 
     log_info "✓ Values.yaml generado: /tmp/${DEPLOYMENT_NAME}-values.yaml"
+    
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        log_info "   → Configurado con BOOTSTRAP AUTOMÁTICO"
+    else
+        log_info "   → Configurado para CLUSTER EXISTENTE"
+    fi
 }
 
 # Función para instalar/actualizar Helm Chart
@@ -407,7 +622,7 @@ deploy_mariadb() {
     helm repo update
     
     # Instalar o actualizar
-    if helm list -n "$NAMESPACE" | grep -q "$DEPLOYMENT_NAME"; then
+    if [[ "$HELM_RELEASE_EXISTS" == "true" ]]; then
         log_warn "Deployment existente encontrado. Actualizando..."
         helm upgrade "$DEPLOYMENT_NAME" bitnami/mariadb-galera \
             --namespace "$NAMESPACE" \
@@ -416,7 +631,7 @@ deploy_mariadb() {
             --wait \
             --timeout 10m
     else
-        log_info "Instalando nuevo deployment..."
+        log_info "Instalando nuevo deployment con BOOTSTRAP AUTOMÁTICO..."
         helm install "$DEPLOYMENT_NAME" bitnami/mariadb-galera \
             --namespace "$NAMESPACE" \
             --values "$values_file" \
@@ -438,11 +653,28 @@ verify_deployment() {
     kubectl wait --for=condition=ready pod \
         -l app.kubernetes.io/name=mariadb-galera,app.kubernetes.io/instance="$DEPLOYMENT_NAME" \
         -n "$NAMESPACE" \
-        --timeout=600s
+        --timeout=600s || {
+            log_error "Timeout esperando pods ready. Mostrando logs del pod-0..."
+            kubectl logs -n "$NAMESPACE" "${DEPLOYMENT_NAME}-mariadb-galera-0" --tail=50
+            return 1
+        }
     
     # Mostrar estado de los pods
     log_info "Estado de los pods:"
     kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/instance="$DEPLOYMENT_NAME"
+    
+    # Verificar cluster size
+    log_info "Verificando tamaño del cluster Galera..."
+    local cluster_size=$(kubectl exec -n "$NAMESPACE" "${DEPLOYMENT_NAME}-mariadb-galera-0" -- \
+        mysql -uroot -p"$ROOT_PASSWORD" -e "SHOW STATUS LIKE 'wsrep_cluster_size';" -sN | awk '{print $2}')
+    
+    log_info "Cluster size: $cluster_size / $REPLICA_COUNT"
+    
+    if [[ "$cluster_size" == "$REPLICA_COUNT" ]]; then
+        log_info "✓ Cluster formado correctamente con $cluster_size nodos"
+    else
+        log_warn "⚠ Cluster size no coincide. Esperado: $REPLICA_COUNT, Actual: $cluster_size"
+    fi
     
     # Verificar PVCs
     log_info "Estado de los PVCs:"
@@ -453,17 +685,17 @@ verify_deployment() {
 
 # Función para mostrar información de conexión
 show_connection_info() {
-    log_info "═══════════════════════════════════════════════════════════"
+    log_info "═══════════════════════════════════════════════════════"
     log_info "Información de Conexión"
-    log_info "═══════════════════════════════════════════════════════════"
+    log_info "═══════════════════════════════════════════════════════"
     echo ""
     echo "Deployment Name: $DEPLOYMENT_NAME"
     echo "Namespace: $NAMESPACE"
     echo "Database: $DB_NAME"
     echo "Username: $DB_USERNAME"
+    echo "Primer Despliegue: $IS_FIRST_DEPLOYMENT"
     echo ""
     
-    # El chart de Bitnami agrega el sufijo -mariadb-galera automáticamente
     local service_base="${DEPLOYMENT_NAME}-mariadb-galera"
     
     echo "Servicio de escritura/lectura:"
@@ -480,11 +712,10 @@ show_connection_info() {
     echo "Para obtener la contraseña root:"
     echo "  kubectl get secret $HELM_SECRET_NAME -n $NAMESPACE -o jsonpath='{.data.mariadb-root-password}' | base64 -d"
     echo ""
-    echo "Comando de conexión desde un pod:"
-    echo "  kubectl run -it --rm mysql-client --image=mysql:8.0 --restart=Never -- \\"
-    echo "    mysql -h${service_base}.${NAMESPACE}.svc.cluster.local -u${DB_USERNAME} -p"
+    echo "Verificar estado del cluster:"
+    echo "  kubectl exec -n $NAMESPACE ${service_base}-0 -- mysql -uroot -p -e \"SHOW STATUS LIKE 'wsrep%';\""
     echo ""
-    log_info "═══════════════════════════════════════════════════════════"
+    log_info "═══════════════════════════════════════════════════════"
 }
 
 # Función para crear script de backup
@@ -548,45 +779,9 @@ spec:
               echo "Namespace: \$NAMESPACE"
               echo "=========================================="
               
-              # Lista de servicios a probar en orden
-              SERVICES=(
-                "\${DEPLOYMENT_NAME}-mariadb-galera.\${NAMESPACE}.svc.cluster.local"
-                "\${DEPLOYMENT_NAME}-mariadb-galera"
-                "\${DEPLOYMENT_NAME}-mariadb-galera-headless.\${NAMESPACE}.svc.cluster.local"
-                "\${DEPLOYMENT_NAME}-mariadb-galera-headless"
-                "\${DEPLOYMENT_NAME}-mariadb-galera-0.\${DEPLOYMENT_NAME}-mariadb-galera-headless.\${NAMESPACE}.svc.cluster.local"
-                "\${DEPLOYMENT_NAME}-mariadb-galera-0.\${DEPLOYMENT_NAME}-mariadb-galera-headless"
-              )
-              
-              SERVICE_NAME=""
-              
-              # Probar cada servicio
-              echo "Probando conectividad..."
-              for svc in "\${SERVICES[@]}"; do
-                echo "  Probando: \$svc"
-                if mysql -h"\$svc" -uroot -p"\$MARIADB_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1; then
-                  SERVICE_NAME="\$svc"
-                  echo "  ✓ Conectado exitosamente"
-                  break
-                else
-                  echo "  ✗ Falló"
-                fi
-              done
-              
-              if [ -z "\$SERVICE_NAME" ]; then
-                echo ""
-                echo "✗ Error fatal: No se pudo conectar a ningún servicio"
-                echo "Servicios probados:"
-                printf '%s\n' "\${SERVICES[@]}"
-                exit 1
-              fi
-              
-              echo ""
-              echo "✓ Usando servicio: \$SERVICE_NAME"
-              echo ""
-              
-              # Crear backup
+              SERVICE_NAME="\${DEPLOYMENT_NAME}-mariadb-galera.\${NAMESPACE}.svc.cluster.local"
               BACKUP_FILE="/backup/backup-\$(date +%Y%m%d-%H%M%S).sql.gz"
+              
               echo "Creando backup en: \$BACKUP_FILE"
               
               /opt/bitnami/mariadb/bin/mariadb-dump \
@@ -603,46 +798,11 @@ spec:
                 --add-drop-database \
                 2>&1 | gzip > "\$BACKUP_FILE"
               
-              # Verificar resultado
-              if [ ! -f "\$BACKUP_FILE" ]; then
-                echo "✗ Error: Archivo de backup no fue creado"
-                exit 1
-              fi
-              
-              BACKUP_SIZE=\$(stat -c%s "\$BACKUP_FILE" 2>/dev/null || stat -f%z "\$BACKUP_FILE" 2>/dev/null)
-              
-              if [ "\$BACKUP_SIZE" -lt 1000 ]; then
-                echo "✗ Error: Backup demasiado pequeño (\$BACKUP_SIZE bytes)"
-                echo "Contenido del backup:"
-                zcat "\$BACKUP_FILE" | head -20
-                exit 1
-              fi
-              
-              echo "✓ Backup completado exitosamente"
-              echo "Tamaño: \$(du -h "\$BACKUP_FILE" | cut -f1)"
-              ls -lh "\$BACKUP_FILE"
-              
-              # Verificar contenido
-              echo ""
-              echo "Primeras líneas del backup:"
-              zcat "\$BACKUP_FILE" | head -5
+              echo "✓ Backup completado: \$(du -h "\$BACKUP_FILE" | cut -f1)"
               
               # Limpiar backups antiguos
-              echo ""
-              echo "Limpiando backups antiguos (retención: \$BACKUP_RETENTION días)..."
-              BEFORE=\$(ls -1 /backup/backup-*.sql.gz 2>/dev/null | wc -l)
               find /backup -name "backup-*.sql.gz" -mtime +\$BACKUP_RETENTION -delete
-              AFTER=\$(ls -1 /backup/backup-*.sql.gz 2>/dev/null | wc -l)
-              DELETED=\$((BEFORE - AFTER))
-              echo "Backups eliminados: \$DELETED"
               
-              echo ""
-              echo "Backups disponibles:"
-              ls -lht /backup/backup-*.sql.gz 2>/dev/null | head -10 || echo "No hay otros backups"
-              
-              echo ""
-              echo "=========================================="
-              echo "Backup finalizado exitosamente"
               echo "=========================================="
           volumes:
           - name: backup-storage
@@ -666,127 +826,6 @@ EOF
     log_info "✓ CronJob de backup creado"
 }
 
-# Función para verificar y crear el provisioner NFS si no existe
-create_nfs_provisioner() {
-    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
-    local nfs_server="$NFS_SERVER"
-    local nfs_path="$NFS_PATH"
-    
-    log_info "Verificando provisioner NFS: $provisioner_name"
-    
-    # Verificar si el provisioner ya existe
-    if kubectl get deployment "nfs-${DEPLOYMENT_NAME}-provisioner" -n infra &> /dev/null; then
-        log_warn "Provisioner NFS ya existe: nfs-${DEPLOYMENT_NAME}-provisioner"
-        return 0
-    fi
-    
-    log_info "Creando nuevo provisioner NFS para el cluster..."
-    
-    # Crear el provisioner
-    cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nfs-${DEPLOYMENT_NAME}-provisioner
-  namespace: infra
-  labels:
-    app: nfs-subdir-external-provisioner
-    release: nfs-${DEPLOYMENT_NAME}-provisioner
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: nfs-subdir-external-provisioner
-      release: nfs-${DEPLOYMENT_NAME}-provisioner
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: nfs-subdir-external-provisioner
-        release: nfs-${DEPLOYMENT_NAME}-provisioner
-    spec:
-      serviceAccountName: nfs-subdir-external-provisionerwso2
-      containers:
-      - env:
-        - name: PROVISIONER_NAME
-          value: ${provisioner_name}
-        - name: NFS_SERVER
-          value: ${nfs_server}
-        - name: NFS_PATH
-          value: ${nfs_path}
-        image: tanzu-harbor.pngd.gob.pe/deploy/nfs-subdir-external-provisioner:v4.0.2
-        imagePullPolicy: IfNotPresent
-        name: nfs-subdir-external-provisioner
-        resources: 
-          requests:
-            cpu: 10m
-            memory: 64Mi
-          limits:
-            cpu: 100m
-            memory: 128Mi
-        securityContext: {}
-        volumeMounts:
-        - mountPath: /persistentvolumes
-          name: nfs-subdir-external-provisioner-root
-      volumes:
-      - name: nfs-subdir-external-provisioner-root
-        nfs:
-          path: ${nfs_path}
-          server: ${nfs_server}
-EOF
-
-    # Esperar a que el provisioner esté listo
-    log_info "Esperando a que el provisioner esté ready..."
-    kubectl wait --for=condition=ready pod \
-        -l release=nfs-${DEPLOYMENT_NAME}-provisioner \
-        -n infra \
-        --timeout=120s
-    
-    log_info "✓ Provisioner NFS creado exitosamente: ${provisioner_name}"
-}
-
-# Función para crear StorageClass con el provisioner específico del cluster
-create_storage_class() {
-    local storage_class="$STORAGE_CLASS"
-    local provisioner_name="cluster.local/nfs-${DEPLOYMENT_NAME}-provisioner"
-    
-    log_info "Verificando StorageClass: $storage_class"
-    
-    if kubectl get storageclass "$storage_class" &> /dev/null; then
-        log_warn "StorageClass $storage_class ya existe"
-        
-        # Verificar si usa el provisioner correcto
-        local current_provisioner=$(kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}')
-        if [[ "$current_provisioner" != "$provisioner_name" ]]; then
-            log_warn "StorageClass usa provisioner diferente: $current_provisioner"
-            log_info "Actualizando StorageClass para usar: $provisioner_name"
-            kubectl delete storageclass "$storage_class"
-        else
-            log_info "StorageClass ya usa el provisioner correcto"
-            return 0
-        fi
-    fi
-
-    log_info "Creando StorageClass: $storage_class con provisioner: $provisioner_name"
-    
-    cat <<EOF | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: $storage_class
-provisioner: $provisioner_name
-parameters:
-  mountPermissions: "0777"
-  mountOptions: "nfsvers=3,tcp,timeo=600,retrans=2"
-reclaimPolicy: Retain
-volumeBindingMode: Immediate
-allowVolumeExpansion: true
-EOF
-    
-    log_info "✓ StorageClass creado exitosamente con provisioner específico del cluster"
-}
-
 # Función principal
 main() {
     local config_file="mariadb-config.yaml"
@@ -804,6 +843,12 @@ main() {
                 echo "Opciones:"
                 echo "  -c, --config    Archivo de configuración YAML (por defecto: mariadb-config.yaml)"
                 echo "  -h, --help      Mostrar esta ayuda"
+                echo ""
+                echo "Características:"
+                echo "  • Detección automática de primer despliegue"
+                echo "  • Bootstrap automático de Galera en primer deploy"
+                echo "  • Configuración inteligente para clusters existentes"
+                echo "  • Persistencia de estado mediante ConfigMap"
                 exit 0
                 ;;
             *)
@@ -813,28 +858,45 @@ main() {
         esac
     done
     
-    log_info "═══════════════════════════════════════════════════════════"
-    log_info "Iniciando Despliegue de MariaDB Galera HA"
-    log_info "═══════════════════════════════════════════════════════════"
+    log_info "═══════════════════════════════════════════════════════"
+    log_info "🚀 Despliegue Automático de MariaDB Galera HA"
+    log_info "═══════════════════════════════════════════════════════"
     log_info "Usando archivo de configuración: $config_file"
+    echo ""
     
     check_dependencies
     parse_config "$config_file"
     create_namespace
+    detect_first_deployment
+    configure_bootstrap
     create_nfs_provisioner
     create_storage_class
     generate_values
     deploy_mariadb
+    
+    # Crear ConfigMap de estado después del primer despliegue exitoso
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        create_state_configmap
+    fi
+    
     create_backup_script
     verify_deployment
     show_connection_info
     
-    log_info "═══════════════════════════════════════════════════════════"
+    echo ""
+    log_info "═══════════════════════════════════════════════════════"
     log_info "✓ Despliegue completado exitosamente"
-    log_info "═══════════════════════════════════════════════════════════"
+    log_info "═══════════════════════════════════════════════════════"
+    
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        echo ""
+        log_info "📝 Notas importantes:"
+        log_info "   • Este fue un PRIMER DESPLIEGUE con bootstrap automático"
+        log_info "   • El ConfigMap '${DEPLOYMENT_NAME}-galera-state' ha sido creado"
+        log_info "   • Futuros deploys usarán configuración normal de HA"
+        log_info "   • No necesitas modificar la configuración manualmente"
+    fi
 }
 
 # Ejecutar
 main "$@"
-
-

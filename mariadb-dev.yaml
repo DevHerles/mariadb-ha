@@ -1,0 +1,69 @@
+################################################################################
+# Configuración Simplificada para MariaDB Galera HA con Bootstrap Automático
+# No requiere configuración manual de Galera - Todo es automático
+################################################################################
+
+# Información del deployment
+deployment:
+  name: mariadb-galera-dev           # Nombre único del deployment
+  namespace: database-dev            # Namespace donde se desplegará
+  chartVersion: latest               # Versión del chart de Bitnami
+
+# Configuración de Storage
+storage:
+  className: mariadb-nfs-dev         # Nombre del StorageClass
+  size: 50Gi                         # Tamaño del volumen
+  
+  # Configuración NFS
+  nfs:
+    server: pcmvsanfs01.pngd.gob.pe
+    path: /vsanfs/PROMETHEUS
+
+# Credenciales (usar secretos seguros en producción)
+credentials:
+  rootPassword: "SuperSecureRootPass123!"
+  username: "wso2carbon"
+  password: "SecureUserPass456!"
+  database: "WSO2AM_DB"
+  backupPassword: "BackupPass789!"
+
+# Configuración del Registry
+registry:
+  url: "tanzu-harbor.pngd.gob.pe/pcm"
+  pullSecret: "harbor-registry-secret"
+
+# Configuración de Alta Disponibilidad
+ha:
+  replicaCount: 3                    # Número de réplicas (mínimo 3 para HA)
+  minAvailable: 2                    # Pods mínimos disponibles durante updates
+
+# Recursos
+resources:
+  requests:
+    cpu: "512m"
+    memory: "2Gi"
+  limits:
+    cpu: "512m"
+    memory: "2Gi"
+
+# Configuración de Backups
+backup:
+  enabled: true                      # Habilitar backups automáticos
+  schedule: "0 2 * * *"              # Cron schedule (2 AM diario)
+  retention: 7                       # Días de retención de backups
+
+# Configuración de Galera (Automático - No modificar)
+galera:
+  enabled: true                      # El bootstrap es automático
+
+# Debug (opcional)
+debug:
+  enabled: true                      # Habilitar logs detallados
+
+# Opciones de limpieza para uninstall
+cleanup:
+  deleteDataPVCs: true               # Eliminar PVCs de datos del cluster
+  deleteNamespace: false             # Eliminar namespace completo
+  deleteStorageClass: true           # Eliminar StorageClass creado
+  deletePullSecret: false            # Mantener el pull secret
+  force: false                       # Saltar confirmación interactiva
