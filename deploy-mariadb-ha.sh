@@ -14,6 +14,8 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 HELM_SECRET_NAME=""
+DEBUG_ENABLED="false"
+GALERA_ENABLED=true
 
 # Función para logging
 log_info() {
@@ -26,6 +28,14 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+to_bool() {
+    local value="${1,,}"
+    case "$value" in
+        true|1|y|yes) echo "true" ;;
+        *) echo "false" ;;
+    esac
 }
 
 # Función para validar dependencias
@@ -76,6 +86,8 @@ parse_config() {
     # Registry
     IMAGE_REGISTRY=$(yq eval '.registry.url' "$config_file")
     PULL_SECRET=$(yq eval '.registry.pullSecret' "$config_file")
+    DEBUG_ENABLED=$(to_bool "$(yq eval '.debug.enabled // false' "$config_file")")
+    GALERA_ENABLED=$(to_bool "$(yq eval '.galera.enabled // true' "$config_file")")
     
     # HA Configuration
     REPLICA_COUNT=$(yq eval '.ha.replicaCount // 3' "$config_file")
@@ -162,6 +174,7 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets:
     - $PULL_SECRET
+  debug: true
 
 ## Autenticación
 auth:
@@ -183,8 +196,18 @@ db:
 replicationUser:
   password: "$BACKUP_PASSWORD"
 
+primary:
+  image:
+    debug: true
+  extraEnvVars:
+    - name: BITNAMI_DEBUG
+      value: "true"
+    - name: NAMI_DEBUG
+      value: "--log-level trace"
+
 ## Configuración de Galera Cluster
 galera:
+  enabled: $GALERA_ENABLED
   name: "${DEPLOYMENT_NAME}-cluster"
   
   bootstrap:
@@ -195,12 +218,10 @@ galera:
     user: mariadbbackup
     password: "$BACKUP_PASSWORD"
   
-  ## Configuración crítica para HA
   cluster:
     name: "${DEPLOYMENT_NAME}-cluster"
     bootstrap: true
   
-  ## Parámetros de configuración de Galera
   extraFlags: |
     --wsrep_slave_threads=4
     --wsrep_retry_autocommit=3
@@ -208,17 +229,19 @@ galera:
     --innodb_flush_log_at_trx_commit=2
     --innodb_buffer_pool_size=1G
     --innodb_log_file_size=256M
+    --log-error-verbosity=3
+    --wsrep_debug=1
 
-## Réplicas - CRÍTICO para HA (mínimo 3)
+## Réplicas
 replicaCount: $REPLICA_COUNT
 
-## Update Strategy - Rolling updates para HA
+## Update Strategy
 updateStrategy:
   type: RollingUpdate
   rollingUpdate:
     partition: 0
 
-## Recursos - Ajustados para producción
+## Recursos
 resources:
   requests:
     memory: "$MEM_REQUEST"
@@ -238,7 +261,7 @@ persistence:
     volume.beta.kubernetes.io/storage-class: "$STORAGE_CLASS"
   selector: {}
 
-## Affinity - CRÍTICO para HA (distribuir pods en diferentes nodos)
+## Affinity
 affinity:
   podAntiAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
@@ -247,28 +270,16 @@ affinity:
             app.kubernetes.io/name: mariadb-galera
             app.kubernetes.io/instance: $DEPLOYMENT_NAME
         topologyKey: kubernetes.io/hostname
-  nodeAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        preference:
-          matchExpressions:
-            - key: node-role.kubernetes.io/worker
-              operator: In
-              values:
-                - "true"
 
-## Tolerations para deployment críticos
-tolerations: []
-
-## Pod Disruption Budget - CRÍTICO para HA
+## Pod Disruption Budget
 podDisruptionBudget:
   enabled: true
   minAvailable: $MIN_AVAILABLE
   maxUnavailable: null
 
-## Probes - Ajustadas para HA
+## Probes (temporalmente deshabilitadas para debug)
 livenessProbe:
-  enabled: true
+  enabled: false
   initialDelaySeconds: 120
   periodSeconds: 10
   timeoutSeconds: 5
@@ -276,7 +287,7 @@ livenessProbe:
   failureThreshold: 3
 
 readinessProbe:
-  enabled: true
+  enabled: false
   initialDelaySeconds: 30
   periodSeconds: 10
   timeoutSeconds: 5
@@ -284,12 +295,7 @@ readinessProbe:
   failureThreshold: 3
 
 startupProbe:
-  enabled: true
-  initialDelaySeconds: 30
-  periodSeconds: 10
-  timeoutSeconds: 5
-  successThreshold: 1
-  failureThreshold: 30
+  enabled: false
 
 ## Service
 service:
@@ -297,10 +303,8 @@ service:
   port: 3306
   headless:
     publishNotReadyAddresses: true
-  annotations:
-    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
 
-## Metrics - Monitoreo en producción
+## Metrics
 metrics:
   enabled: true
   image:
@@ -321,100 +325,39 @@ metrics:
   
   serviceMonitor:
     enabled: false
-    namespace: $NAMESPACE
-    interval: 30s
-    scrapeTimeout: 10s
 
 ## Configuración de MariaDB
 config: |
   [mysqld]
-  ## Configuración de red
   bind-address=0.0.0.0
   max_connections=500
-  connect_timeout=10
-  wait_timeout=28800
-  
-  ## Configuración de caché
-  table_open_cache=4000
-  table_definition_cache=2000
-  query_cache_size=0
-  query_cache_type=0
-  
-  ## InnoDB Settings
   innodb_buffer_pool_size=1G
   innodb_log_file_size=256M
-  innodb_flush_method=O_DIRECT
   innodb_flush_log_at_trx_commit=2
-  innodb_file_per_table=1
-  innodb_io_capacity=200
-  innodb_read_io_threads=4
-  innodb_write_io_threads=4
-  
-  ## Binary Log
   log_bin=mysql-bin
   binlog_format=ROW
-  expire_logs_days=7
-  max_binlog_size=100M
-  
-  ## Slow Query Log
-  slow_query_log=1
-  slow_query_log_file=/opt/bitnami/mariadb/logs/slow.log
-  long_query_time=2
-  
-  ## Galera Settings
   wsrep_on=ON
   wsrep_provider=/opt/bitnami/mariadb/lib/libgalera_smm.so
   wsrep_sst_method=mariabackup
-  wsrep_slave_threads=4
-  wsrep_retry_autocommit=3
-  
-  ## Replicación
-  binlog_do_db=$DB_NAME
-  
-  ## Performance
-  max_allowed_packet=256M
-  max_heap_table_size=64M
-  tmp_table_size=64M
-  
-  ## Seguridad
-  local_infile=0
+  wsrep_debug=1
+  log_error_verbosity=3
+  general_log=1
+  general_log_file=/opt/bitnami/mariadb/logs/general.log
 
-## Init Scripts (si necesitas)
-# initdbScriptsConfigMap: "mariadb-init-scripts"
-
-## Security Context
+## Security Context para NFS
 podSecurityContext:
-  enabled: true
-  fsGroup: 1001
-  runAsGroup: 1001
-  runAsUser: 1001
-  runAsNonRoot: true
-
-containerSecurityContext:
-  enabled: true
-  runAsUser: 1001
-  runAsGroup: 1001
-  runAsNonRoot: true
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop:
-      - ALL
-
-## Network Policy (opcional, ajustar según necesidad)
-networkPolicy:
   enabled: false
 
-## Pod Labels y Annotations
-podLabels:
-  app: mariadb-galera
-  environment: production
-  deployment: $DEPLOYMENT_NAME
+containerSecurityContext:
+  enabled: false
 
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "9104"
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+  fsGroupChangePolicy: "OnRootMismatch"
 
-## Volume Permissions (para NFS)
+## Volume Permissions
 volumePermissions:
   enabled: true
   image:
@@ -771,3 +714,4 @@ main() {
 
 # Ejecutar
 main "$@"
+
