@@ -341,9 +341,170 @@ EOF
     log_info "✓ StorageClass creado exitosamente"
 }
 
+# Función para recuperar cluster cuando no hay pods ready
+recover_cluster_if_needed() {
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        return
+    fi
+
+    local sts_name="${DEPLOYMENT_NAME}-mariadb-galera"
+    if ! kubectl get sts "$sts_name" -n "$NAMESPACE" &>/dev/null; then
+        log_debug "StatefulSet $sts_name no encontrado; omitiendo recuperación forzada"
+        return
+    fi
+
+    local selector="app.kubernetes.io/name=mariadb-galera,app.kubernetes.io/instance=$DEPLOYMENT_NAME"
+    local pods_output
+    pods_output=$(kubectl get pods -n "$NAMESPACE" -l "$selector" --no-headers 2>/dev/null || true)
+    local total_pods
+    total_pods=$(printf "%s\n" "$pods_output" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+    local ready_pods=0
+    if [[ -n "$pods_output" ]]; then
+        ready_pods=$(printf "%s\n" "$pods_output" | awk '$2 ~ /^[0-9]+\/[0-9]+$/ {split($2,a,"/"); if (a[1]==a[2] && a[1]>0) ready++} END{print ready+0}')
+    fi
+
+    if (( total_pods == 0 )); then
+        log_warn "No se encontraron pods activos del cluster. Se intentará recuperación de datos previa al despliegue."
+    elif (( ready_pods > 0 )); then
+        log_info "Cluster con pods en ejecución detectado (${ready_pods}/${total_pods}). No se requiere recuperación forzada."
+        return
+    else
+        log_warn "Cluster sin pods Ready (${ready_pods}/${total_pods}). Se procederá con recuperación forzada antes del despliegue."
+    fi
+
+    local pvc_name="data-${sts_name}-0"
+    if ! kubectl get pvc "$pvc_name" -n "$NAMESPACE" &>/dev/null; then
+        log_warn "PVC $pvc_name no encontrado. No se puede forzar automáticamente safe_to_bootstrap."
+        return
+    fi
+
+    log_info "Escalando StatefulSet $sts_name a 0 para limpieza segura..."
+    kubectl scale sts "$sts_name" --replicas=0 -n "$NAMESPACE"
+
+    log_info "Esperando eliminación de pods previos..."
+    local elapsed=0
+    while kubectl get pods -n "$NAMESPACE" -l "$selector" --no-headers 2>/dev/null | grep -q '.'; do
+        sleep 5
+        elapsed=$((elapsed+5))
+        if (( elapsed >= 180 )); then
+            log_warn "Timeout esperando eliminación de pods previos. Continuando con la recuperación."
+            break
+        fi
+    done
+
+    local fix_pod="${DEPLOYMENT_NAME}-galera-recovery"
+    local fix_image_registry="$IMAGE_REGISTRY"
+    if [[ -z "$fix_image_registry" || "$fix_image_registry" == "null" ]]; then
+        fix_image_registry="docker.io/bitnami"
+    fi
+    local fix_image="${fix_image_registry}/mariadb-galera:12.0.2-debian-12-r0"
+
+    log_info "Creando pod temporal $fix_pod para ajustar safe_to_bootstrap..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $fix_pod
+  namespace: $NAMESPACE
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
+    runAsNonRoot: false
+$(if [[ -n "$PULL_SECRET" && "$PULL_SECRET" != "null" ]]; then
+cat <<EOS
+  imagePullSecrets:
+    - name: $PULL_SECRET
+EOS
+fi)
+  containers:
+  - name: fix
+    image: $fix_image
+    command: ["/bin/sh","-c","sleep 600"]
+    volumeMounts:
+    - name: data
+      mountPath: /bitnami/mariadb
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: $pvc_name
+EOF
+
+    if ! kubectl wait -n "$NAMESPACE" --for=condition=Ready pod/"$fix_pod" --timeout=180s; then
+        log_warn "No se pudo preparar el pod temporal $fix_pod. Cancelando recuperación forzada."
+        kubectl delete pod "$fix_pod" -n "$NAMESPACE" --ignore-not-found
+        return
+    fi
+
+    log_info "Marcando safe_to_bootstrap=1 en los archivos encontrados..."
+    if ! kubectl exec -n "$NAMESPACE" "$fix_pod" -- /bin/bash -c '
+set -e
+DATA_MOUNT="/bitnami/mariadb"
+TARGET_FILES=$(find "$DATA_MOUNT" -maxdepth 6 -name grastate.dat 2>/dev/null | sort)
+if [ -z "$TARGET_FILES" ]; then
+  mkdir -p "$DATA_MOUNT/data"
+  TARGET_FILES="$DATA_MOUNT/data/grastate.dat"
+fi
+for TARGET_FILE in $TARGET_FILES; do
+  echo "[recovery] Ajustando safe_to_bootstrap en $TARGET_FILE"
+  TARGET_DIR=$(dirname "$TARGET_FILE")
+  rm -f "$TARGET_DIR"/gvwstate.dat "$TARGET_DIR"/galera.cache "$TARGET_DIR"/galera.cache.lock "$TARGET_DIR"/galera.state \
+        "$TARGET_DIR"/gcache.page* "$TARGET_DIR"/gcache.* "$TARGET_DIR"/gcache* 2>/dev/null || true
+  if [ -f "$TARGET_FILE" ]; then
+    if grep -q "^safe_to_bootstrap: 0" "$TARGET_FILE"; then
+      sed -i "s/^safe_to_bootstrap: 0/safe_to_bootstrap: 1/" "$TARGET_FILE"
+    elif ! grep -q "^safe_to_bootstrap:" "$TARGET_FILE"; then
+      echo "safe_to_bootstrap: 1" >> "$TARGET_FILE"
+    fi
+  else
+    UUID=$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || (cat /proc/sys/kernel/random/uuid 2>/dev/null) || echo 00000000-0000-0000-0000-000000000000 )
+    {
+      echo "# GALERA saved state"
+      echo "version: 2.1"
+      echo "uuid:    $UUID"
+      echo "seqno:   -1"
+      echo "safe_to_bootstrap: 1"
+    } > "$TARGET_FILE"
+  fi
+done
+MARIADB_UID=$(id -u mysql 2>/dev/null || echo 1001)
+MARIADB_GID=$(id -g mysql 2>/dev/null || echo 1001)
+chown -R "${MARIADB_UID}:${MARIADB_GID}" "$DATA_MOUNT" 2>/dev/null || true
+chmod -R g+rwX "$DATA_MOUNT" 2>/dev/null || true
+'; then
+        log_warn "Falló el ajuste de safe_to_bootstrap. Eliminando pod temporal $fix_pod."
+        kubectl delete pod "$fix_pod" -n "$NAMESPACE" --ignore-not-found
+        return
+    fi
+
+    kubectl delete pod "$fix_pod" -n "$NAMESPACE" --ignore-not-found
+
+    log_info "Re-escalando StatefulSet $sts_name a 1 réplica para bootstrap seguro..."
+    kubectl scale sts "$sts_name" --replicas=1 -n "$NAMESPACE"
+    if ! kubectl wait --for=condition=ready pod/"${sts_name}-0" -n "$NAMESPACE" --timeout=300s; then
+        log_warn "Timeout esperando que ${sts_name}-0 quede Ready tras recuperación. Continuando de todas maneras."
+    fi
+
+    if (( REPLICA_COUNT > 1 )); then
+        log_info "Escalando StatefulSet $sts_name a $REPLICA_COUNT réplicas..."
+        kubectl scale sts "$sts_name" --replicas="$REPLICA_COUNT" -n "$NAMESPACE"
+    fi
+
+    log_info "Recuperación previa al despliegue completada."
+}
+
 # Función para generar values.yaml con bootstrap automático
 generate_values() {
     log_info "Generando values.yaml optimizado para HA..."
+    
+    local cluster_bootstrap="false"
+    local force_safe_to_bootstrap="false"
+    if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
+        cluster_bootstrap="true"
+        force_safe_to_bootstrap="true"
+    fi
     
     cat > "/tmp/${DEPLOYMENT_NAME}-values.yaml" <<EOF
 ################################################################################
@@ -404,23 +565,13 @@ primary:
 galera:
   enabled: $GALERA_ENABLED
   name: "${DEPLOYMENT_NAME}-cluster"
-$(if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
-    cat <<BOOTSTRAP_CONFIG
   bootstrap:
     bootstrapFromNode: 0
-    forceSafeToBootstrap: true
-  
+    forceSafeToBootstrap: $force_safe_to_bootstrap
+
   cluster:
     name: "${DEPLOYMENT_NAME}-cluster"
-    bootstrap: true
-BOOTSTRAP_CONFIG
-else
-    cat <<NORMAL_CONFIG
-  cluster:
-    name: "${DEPLOYMENT_NAME}-cluster"
-    bootstrap: false
-NORMAL_CONFIG
-fi)
+    bootstrap: $cluster_bootstrap
   
   mariabackup:
     user: mariadbbackup
@@ -623,6 +774,7 @@ deploy_mariadb() {
     
     # Instalar o actualizar
     if [[ "$HELM_RELEASE_EXISTS" == "true" ]]; then
+        recover_cluster_if_needed
         log_warn "Deployment existente encontrado. Actualizando..."
         helm upgrade "$DEPLOYMENT_NAME" bitnami/mariadb-galera \
             --namespace "$NAMESPACE" \
@@ -900,3 +1052,4 @@ main() {
 
 # Ejecutar
 main "$@"
+

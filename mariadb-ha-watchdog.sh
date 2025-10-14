@@ -33,8 +33,8 @@ if [ -z "$PVC" ]; then
   exit 1
 fi
 
-DATA_DIR="${DATA_DIR:-/var/lib/mysql}"            # Path volumen datos en pod
-FIX_IMAGE="${FIX_IMAGE:-tanzu-harbor.pngd.gob.pe/mef-ped-prod/mariadb:10.6}"  # Imagen fix pod
+DATA_DIR="${DATA_DIR:-/bitnami/mariadb}"          # Ruta de montaje del PVC en el pod temporal
+FIX_IMAGE="${FIX_IMAGE:-tanzu-harbor.pngd.gob.pe/pcm/mariadb-galera:12.0.2-debian-12-r0}"  # Imagen fix pod
 
 SLEEP_SECONDS="${SLEEP_SECONDS:-30}"               # Intervalo chequeo
 TMP_DIR="${TMP_DIR:-$(mktemp -d -t ha-watchdog-XXXXXX)}"
@@ -122,6 +122,11 @@ metadata:
   namespace: ${NS}
 spec:
   restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
+    runAsNonRoot: false
   containers:
   - name: fix
     image: ${FIX_IMAGE}
@@ -138,28 +143,46 @@ EOF
 }
 
 fix_grastate(){
-  # Limpia archivos conflictivos en el volumen de datos
+  # Limpia archivos conflictivos en el volumen de datos y fuerza safe_to_bootstrap=1
   kubectl -n "$NS" --context="$CTX" exec mariadb-fix -- /bin/sh -c "
     set -e
-    rm -f ${DATA_DIR}/gvwstate.dat ${DATA_DIR}/galera.cache ${DATA_DIR}/galera.cache.lock ${DATA_DIR}/galera.state \
-          ${DATA_DIR}/gcache.page* ${DATA_DIR}/gcache.* ${DATA_DIR}/gcache* 2>/dev/null || true
-    if [ -f ${DATA_DIR}/grastate.dat ]; then
-      if grep -q '^safe_to_bootstrap: 0' ${DATA_DIR}/grastate.dat; then
-        sed -i 's/^safe_to_bootstrap: 0/safe_to_bootstrap: 1/' ${DATA_DIR}/grastate.dat
-      elif ! grep -q '^safe_to_bootstrap:' ${DATA_DIR}/grastate.dat; then
-        echo 'safe_to_bootstrap: 1' >> ${DATA_DIR}/grastate.dat
-      fi
-    else
-      UUID=\$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || (cat /proc/sys/kernel/random/uuid 2>/dev/null) || echo 00000000-0000-0000-0000-000000000000 )
-      {
-        echo '# GALERA saved state'
-        echo 'version: 2.1'
-        echo \"uuid:    \${UUID}\"
-        echo 'seqno:   -1'
-        echo 'safe_to_bootstrap: 1'
-      } > ${DATA_DIR}/grastate.dat
+    DATA_MOUNT='${DATA_DIR}'
+
+    TARGET_FILES=\$(find \"\$DATA_MOUNT\" -maxdepth 6 -name grastate.dat 2>/dev/null | sort)
+    if [ -z \"\$TARGET_FILES\" ]; then
+      mkdir -p \"\$DATA_MOUNT/data\"
+      TARGET_FILES=\"\$DATA_MOUNT/data/grastate.dat\"
     fi
-    chown -R mysql:mysql ${DATA_DIR}
+
+    for TARGET_FILE in \$TARGET_FILES; do
+      echo \"[watchdog] Ajustando grastate en \$TARGET_FILE\"
+      TARGET_DIR=\$(dirname \"\$TARGET_FILE\")
+
+      rm -f \"\$TARGET_DIR\"/gvwstate.dat \"\$TARGET_DIR\"/galera.cache \"\$TARGET_DIR\"/galera.cache.lock \"\$TARGET_DIR\"/galera.state \
+            \"\$TARGET_DIR\"/gcache.page* \"\$TARGET_DIR\"/gcache.* \"\$TARGET_DIR\"/gcache* 2>/dev/null || true
+
+      if [ -f \"\$TARGET_FILE\" ]; then
+        if grep -q '^safe_to_bootstrap: 0' \"\$TARGET_FILE\"; then
+          sed -i 's/^safe_to_bootstrap: 0/safe_to_bootstrap: 1/' \"\$TARGET_FILE\"
+        elif ! grep -q '^safe_to_bootstrap:' \"\$TARGET_FILE\"; then
+          echo 'safe_to_bootstrap: 1' >> \"\$TARGET_FILE\"
+        fi
+      else
+        UUID=\$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || (cat /proc/sys/kernel/random/uuid 2>/dev/null) || echo 00000000-0000-0000-0000-000000000000 )
+        {
+          echo '# GALERA saved state'
+          echo 'version: 2.1'
+          echo \"uuid:    \$UUID\"
+          echo 'seqno:   -1'
+          echo 'safe_to_bootstrap: 1'
+        } > \"\$TARGET_FILE\"
+      fi
+    done
+
+    MARIADB_UID=\$(id -u mysql 2>/dev/null || echo 1001)
+    MARIADB_GID=\$(id -g mysql 2>/dev/null || echo 1001)
+    chown -R \"\${MARIADB_UID}:\${MARIADB_GID}\" \"\$DATA_MOUNT\" 2>/dev/null || true
+    chmod -R g+rwX \"\$DATA_MOUNT\" 2>/dev/null || true
   "
 }
 
