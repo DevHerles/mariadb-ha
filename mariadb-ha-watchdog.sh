@@ -2,25 +2,10 @@
 set -euo pipefail
 
 # =======================
-# MariaDB Galera HA Watchdog con Notificaciones Slack
-#
-# Detecta caídas totales y fuerza recuperación segura:
-# - Escala STS a 0 para eliminar pods
-# - Crea pod temporal con PVC para limpiar archivos galera
-# - Ajusta grastate.dat para bootstrap
-# - Escala STS a 1 y luego a replicas deseadas
-# - Notifica cada paso crítico a Slack
-#
-# Uso:
-#   CTX=my-k8s-context SLACK_WEBHOOK_URL=https://hooks.slack.com/... ./mariadb-ha-watchdog.sh
-#   ./mariadb-ha-watchdog.sh --unlock    # limpia lock
-#   ./mariadb-ha-watchdog.sh --force     # fuerza ejecución ignorando lock
-#
-# Variables configurables (env):
-#   NS, STS, CTX, DATA_DIR, FIX_IMAGE, SLEEP_SECONDS, PVC, SLACK_WEBHOOK_URL
+# MariaDB Galera HA Watchdog OPTIMIZADO
 # =======================
 
-# ====== CONFIG =======
+# ====== CONFIG OPTIMIZADO =======
 NS="${NS:-nextcloud}"
 STS="${STS:-mariadb}"
 CTX="${CTX:-}"
@@ -35,19 +20,24 @@ if [ -z "$PVC" ]; then
 fi
 
 DATA_DIR="${DATA_DIR:-/bitnami/mariadb}"
-FIX_IMAGE="${FIX_IMAGE:-tanzu-harbor.pngd.gob.pe/pcm/mariadb-galera:12.0.2-debian-12-r0}"
+# Imagen más liviana para operaciones de fix
+FIX_IMAGE="${FIX_IMAGE:-busybox:1.36}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 
+# Timeouts optimizados (en segundos para cálculos)
 SLEEP_SECONDS="${SLEEP_SECONDS:-30}"
+POD_CREATION_TIMEOUT="${POD_CREATION_TIMEOUT:-60}"
+POD_READY_TIMEOUT="${POD_READY_TIMEOUT:-30}"
+POD_DELETE_FAST_TIMEOUT="${POD_DELETE_FAST_TIMEOUT:-90}"
+BOOTSTRAP_READY_TIMEOUT="${BOOTSTRAP_READY_TIMEOUT:-120}"
+
 TMP_DIR="${TMP_DIR:-$(mktemp -d -t ha-watchdog-XXXXXX)}"
 LOCK_FILE="${LOCK_FILE:-${TMP_DIR}/watchdog.lock}"
 LOCK_TTL="${LOCK_TTL:-600}"
 COOLOFF_ON_FAIL="${COOLOFF_ON_FAIL:-90}"
 RUNNING_STALE="${RUNNING_STALE:-300}"
-WAIT_POD_DELETE_TIMEOUT="${WAIT_POD_DELETE_TIMEOUT:-180s}"
-WAIT_FIX_READY_TIMEOUT="${WAIT_FIX_READY_TIMEOUT:-180s}"
-WAIT_STS_READY_TIMEOUT="${WAIT_STS_READY_TIMEOUT:-300s}"
-DESIRED_REPLICAS_DEFAULT="${DESIRED_REPLICAS_DEFAULT:-3}"
+# FORZAR 3 RÉPLICAS PARA HA - SIEMPRE
+DESIRED_REPLICAS="${DESIRED_REPLICAS:-3}"
 # =====================
 
 # Log con timestamp
@@ -66,14 +56,24 @@ send_slack_notification() {
   local message="$1"
   local color="${2:-#36a64f}"  # Verde por defecto
   local title="${3:-MariaDB Watchdog}"
+  local formatted_message
+  formatted_message=$(printf '%b' "$message")
   
   # Si no hay webhook configurado, solo logear
   if [ -z "$SLACK_WEBHOOK_URL" ]; then
-    log "[SLACK DISABLED] $message"
+    log "[SLACK DISABLED] $formatted_message"
     return 0
+  fi
+
+  if ! have_cmd python3; then
+    log "[SLACK] python3 no disponible para escapar payload, omitiendo notificación. Mensaje: $formatted_message"
+    return 1
   fi
   
   local timestamp=$(date +%s)
+  local escaped_message
+  escaped_message=$(python3 -c 'import json,sys; msg=sys.stdin.read(); print(json.dumps(msg)[1:-1], end="")' <<<"$formatted_message")
+
   local payload=$(cat <<EOF
 {
   "username": "MariaDB Watchdog",
@@ -82,7 +82,9 @@ send_slack_notification() {
     {
       "color": "$color",
       "title": "$title",
-      "text": "$message",
+      "text": "$escaped_message",
+      "fallback": "$escaped_message",
+      "mrkdwn_in": ["text", "fields"],
       "fields": [
         {
           "title": "Namespace",
@@ -113,7 +115,7 @@ send_slack_notification() {
 EOF
 )
   
-  if curl -X POST -H 'Content-type: application/json' \
+  if curl --fail -X POST -H 'Content-type: application/json' \
       --data "$payload" \
       --max-time 10 \
       --silent \
@@ -125,26 +127,26 @@ EOF
 }
 
 send_slack_critical() {
-  send_slack_notification "$1" "#ff0000" "🔴 CRÍTICO - MariaDB Cluster"
+  send_slack_notification "$1" "#ff0000" ":red_circle: CRÍTICO - MariaDB Cluster"
 }
 
 send_slack_warning() {
-  send_slack_notification "$1" "#ff9900" "⚠️ ADVERTENCIA - MariaDB Cluster"
+  send_slack_notification "$1" "#ff9900" ":warning: ADVERTENCIA - MariaDB Cluster"
 }
 
 send_slack_info() {
-  send_slack_notification "$1" "#36a64f" "✅ ÉXITO - MariaDB Cluster"
+  send_slack_notification "$1" "#36a64f" ":white_check_mark: ÉXITO - MariaDB Cluster"
 }
 
 send_slack_recovery_start() {
   local replicas="$1"
   local message="*Cluster MariaDB completamente caído detectado*\n\n"
-  message="${message}📊 *Estado actual:*\n"
+  message="${message}:bar_chart: *Estado actual:*\n"
   message="${message}• Réplicas configuradas: ${replicas}\n"
   message="${message}• Pods Ready: 0\n"
   message="${message}• PVC afectado: \`${PVC}\`\n\n"
-  message="${message}🔧 *Iniciando recuperación automática...*\n"
-  message="${message}_El proceso tomará aproximadamente 3-5 minutos_"
+  message="${message}:wrench: *Iniciando recuperación automática...*\n"
+  message="${message}_El proceso tomará aproximadamente 1-2 minutos_"
   
   send_slack_critical "$message"
 }
@@ -154,17 +156,17 @@ send_slack_recovery_step() {
   local total="$2"
   local description="$3"
   local message="*Recuperación en progreso* (${step}/${total})\n\n"
-  message="${message}🔄 ${description}"
+  message="${message}:arrows_counterclockwise: ${description}"
   
-  send_slack_notification "$message" "#439FE0" "🔧 Recuperando - MariaDB Cluster"
+  send_slack_notification "$message" "#439FE0" ":wrench: Recuperando - MariaDB Cluster"
 }
 
 send_slack_recovery_success() {
   local replicas="$1"
   local duration="$2"
-  local message="*Recuperación completada exitosamente* ✅\n\n"
-  message="${message}📊 *Estado final:*\n"
-  message="${message}• Cluster operativo: ✅\n"
+  local message="*Recuperación completada exitosamente* :white_check_mark:\n\n"
+  message="${message}:bar_chart: *Estado final:*\n"
+  message="${message}• Cluster operativo: :white_check_mark:\n"
   message="${message}• Réplicas activas: ${replicas}\n"
   message="${message}• Duración: ${duration}s\n\n"
   message="${message}El cluster MariaDB Galera está funcionando normalmente."
@@ -174,10 +176,10 @@ send_slack_recovery_success() {
 
 send_slack_recovery_failed() {
   local error="$1"
-  local message="*Recuperación FALLIDA* ❌\n\n"
-  message="${message}⚠️ *Error:*\n"
+  local message="*Recuperación FALLIDA* :x:\n\n"
+  message="${message}:warning: *Error:*\n"
   message="${message}\`\`\`${error}\`\`\`\n\n"
-  message="${message}🔴 *Acción requerida:*\n"
+  message="${message}:red_circle: *Acción requerida:*\n"
   message="${message}Se requiere intervención manual. El watchdog reintentará automáticamente."
   
   send_slack_critical "$message"
@@ -210,6 +212,7 @@ pods_of_sts_exist(){
 }
 
 scale_sts(){
+  log "Escalando ${STS} a $1 réplicas..."
   kubectl -n "$NS" --context="$CTX" scale sts "$STS" --replicas="$1" >/dev/null
 }
 
@@ -226,33 +229,56 @@ count_ready_pods(){
   fi
 }
 
-wait_delete_pods(){
-  log "Esperando eliminación de pods..."
-  
-  # Espera eliminación pods con label app=STS
-  if kubectl -n "$NS" --context="$CTX" get pods -l app="${STS}" >/dev/null 2>&1; then
-    for p in $(kubectl -n "$NS" --context="$CTX" get pods -l app="${STS}" -o name 2>/dev/null); do
-      kubectl -n "$NS" --context="$CTX" wait --for=delete "$p" --timeout="${WAIT_POD_DELETE_TIMEOUT}" 2>/dev/null || true
-    done
+ensure_minimum_replicas(){
+  local desired="$DESIRED_REPLICAS"
+  local current scaled=0
+  current=$(get_replicas || echo 0)
+  if [ "$current" -lt "$desired" ]; then
+    log "Réplicas configuradas (${current}) por debajo del mínimo HA (${desired}); escalando inmediatamente."
+    send_slack_warning "Se detectaron ${current} réplicas configuradas en ${NS}/${STS}. Forzando escalado a ${desired} para mantener Alta Disponibilidad."
+    scale_sts "$desired"
+    scaled=1
   fi
+
+  if [ "$scaled" -eq 1 ]; then
+    log "Verificando estado del cluster tras escalado automático a ${desired} réplicas..."
+    if wait_all_replicas_ready "$desired"; then
+      log "✓ Escalado automático completado: ${desired} réplicas listas."
+      send_slack_info "Escalado automático completado en ${NS}/${STS}: ${desired} réplicas listas tras ajuste de Alta Disponibilidad."
+    else
+      log "⚠️ Escalado automático no alcanzó todas las réplicas Ready."
+      send_slack_warning "Escalado automático en ${NS}/${STS} no logró ${desired} réplicas Ready en el tiempo esperado. Revisar estado del cluster."
+    fi
+  fi
+}
+
+wait_delete_pods(){
+  log "Eliminación rápida de pods..."
   
-  # Espera hasta que no queden pods del STS
+  # Forzar eliminación inmediata
+  kubectl -n "$NS" --context="$CTX" delete pods -l app="${STS}" --force --grace-period=0 >/dev/null 2>&1 || true
+  
+  # Espera optimizada
   local i=0
-  while [ $i -lt 36 ]; do
-    pods_of_sts_exist || { log "Pods eliminados correctamente"; return 0; }
+  while [ $i -lt 18 ]; do  # 90s máximo
+    if ! pods_of_sts_exist; then 
+      log "✓ Pods eliminados rápidamente"
+      return 0
+    fi
     sleep 5
     i=$((i+1))
   done
   
-  log "Timeout esperando eliminación, continuando..."
+  log "⚠️ Eliminación tomó más tiempo del esperado, continuando..."
   return 0
 }
 
 create_fix_pod(){
   local pvc_name="$1"
-  log "Creando pod temporal para ajustar grastate.dat..."
+  log "Creando pod temporal optimizado..."
   
-  kubectl -n "$NS" --context="$CTX" apply -f - <<EOF
+  # Pre-crear el pod de forma asíncrona
+  kubectl -n "$NS" --context="$CTX" apply -f - <<EOF >/dev/null 2>&1 &
 apiVersion: v1
 kind: Pod
 metadata:
@@ -272,90 +298,111 @@ spec:
     volumeMounts:
     - name: data
       mountPath: ${DATA_DIR}
+    readinessProbe:
+      exec:
+        command: ["/bin/sh", "-c", "test -f /bin/sh"]
+      initialDelaySeconds: 1
+      periodSeconds: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+  priorityClassName: system-node-critical
   volumes:
   - name: data
     persistentVolumeClaim:
       claimName: ${pvc_name}
 EOF
   
-  log "Esperando que pod temporal esté listo..."
-  if kubectl -n "$NS" --context="$CTX" wait --for=condition=Ready pod/mariadb-fix --timeout="${WAIT_FIX_READY_TIMEOUT}" >/dev/null 2>&1; then
-    log "Pod temporal listo"
+  local creation_pid=$!
+  
+  # Esperar creación con timeout reducido
+  log "Esperando creación del pod (${POD_CREATION_TIMEOUT}s)..."
+  if timeout "${POD_CREATION_TIMEOUT}s" bash -c "
+    until kubectl -n '$NS' --context='$CTX' get pod/mariadb-fix >/dev/null 2>&1; do
+      sleep 1
+    done
+  "; then
+    log "✓ Pod creado exitosamente"
+    wait $creation_pid 2>/dev/null
   else
-    log "ERROR: Pod temporal no quedó listo"
+    log "ERROR: Timeout en creación del pod"
+    kill $creation_pid 2>/dev/null 2>&1
+    return 1
+  fi
+  
+  # Esperar readiness optimizado
+  log "Esperando que pod temporal esté listo..."
+  if kubectl -n "$NS" --context="$CTX" wait --for=condition=Ready pod/mariadb-fix --timeout="${POD_READY_TIMEOUT}s" >/dev/null 2>&1; then
+    log "✓ Pod temporal listo en ${POD_READY_TIMEOUT}s"
+    return 0
+  else
+    log "ERROR: Pod temporal no quedó listo en el tiempo esperado"
     return 1
   fi
 }
 
 fix_grastate(){
-  log "Ajustando grastate.dat y limpiando archivos de Galera..."
+  log "Ajustando grastate.dat (versión optimizada)..."
   
-  kubectl -n "$NS" --context="$CTX" exec mariadb-fix -- /bin/bash -c '
+  kubectl -n "$NS" --context="$CTX" exec mariadb-fix -- /bin/sh -c '
     set -e
     DATA_MOUNT="'"${DATA_DIR}"'"
     
-    echo "[recovery] Iniciando limpieza en $DATA_MOUNT"
+    echo "[recovery] Buscando grastate.dat..."
     
-    TARGET_FILES=$(find "$DATA_MOUNT" -maxdepth 6 -name grastate.dat 2>/dev/null | sort)
-    if [ -z "$TARGET_FILES" ]; then
-      echo "[recovery] No se encontró grastate.dat, creando directorio data"
+    # Búsqueda optimizada
+    TARGET_FILE=$(find "$DATA_MOUNT" -maxdepth 3 -name grastate.dat -type f 2>/dev/null | head -1)
+    
+    if [ -z "$TARGET_FILE" ]; then
+      echo "[recovery] No encontrado, creando en $DATA_MOUNT/data"
       mkdir -p "$DATA_MOUNT/data"
-      TARGET_FILES="$DATA_MOUNT/data/grastate.dat"
+      TARGET_FILE="$DATA_MOUNT/data/grastate.dat"
     fi
     
-    for TARGET_FILE in $TARGET_FILES; do
-      echo "[recovery] Procesando: $TARGET_FILE"
-      TARGET_DIR=$(dirname "$TARGET_FILE")
-      
-      # Limpiar archivos de Galera
-      rm -f "$TARGET_DIR"/gvwstate.dat \
-            "$TARGET_DIR"/galera.cache \
-            "$TARGET_DIR"/galera.cache.lock \
-            "$TARGET_DIR"/galera.state \
-            "$TARGET_DIR"/gcache.page* \
-            "$TARGET_DIR"/gcache.* \
-            "$TARGET_DIR"/gcache* 2>/dev/null || true
-      
-      # Ajustar safe_to_bootstrap
-      if [ -f "$TARGET_FILE" ]; then
-        if grep -q "^safe_to_bootstrap: 0" "$TARGET_FILE"; then
-          sed -i "s/^safe_to_bootstrap: 0/safe_to_bootstrap: 1/" "$TARGET_FILE"
-          echo "[recovery] ✓ Cambiado safe_to_bootstrap de 0 a 1"
-        elif ! grep -q "^safe_to_bootstrap:" "$TARGET_FILE"; then
-          echo "safe_to_bootstrap: 1" >> "$TARGET_FILE"
-          echo "[recovery] ✓ Agregado safe_to_bootstrap: 1"
-        else
-          echo "[recovery] safe_to_bootstrap ya está en 1"
-        fi
+    TARGET_DIR=$(dirname "$TARGET_FILE")
+    
+    # Limpieza rápida
+    echo "[recovery] Limpiando archivos de Galera..."
+    rm -f "$TARGET_DIR"/gvwstate.dat \
+          "$TARGET_DIR"/galera.cache \
+          "$TARGET_DIR"/galera.cache.lock \
+          "$TARGET_DIR"/galera.state \
+          "$TARGET_DIR"/gcache.* 2>/dev/null || true
+    
+    # Procesamiento eficiente
+    echo "[recovery] Procesando: $TARGET_FILE"
+    if [ -f "$TARGET_FILE" ]; then
+      if grep -q "^safe_to_bootstrap: 0" "$TARGET_FILE"; then
+        sed -i "s/^safe_to_bootstrap: 0/safe_to_bootstrap: 1/" "$TARGET_FILE"
+        echo "[recovery] ✓ safe_to_bootstrap: 0 → 1"
+      elif ! grep -q "^safe_to_bootstrap:" "$TARGET_FILE"; then
+        echo "safe_to_bootstrap: 1" >> "$TARGET_FILE"
+        echo "[recovery] ✓ safe_to_bootstrap: 1 agregado"
       else
-        UUID=$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || \
-                (cat /proc/sys/kernel/random/uuid 2>/dev/null) || \
-                echo 00000000-0000-0000-0000-000000000000 )
-        {
-          echo "# GALERA saved state"
-          echo "version: 2.1"
-          echo "uuid:    $UUID"
-          echo "seqno:   -1"
-          echo "safe_to_bootstrap: 1"
-        } > "$TARGET_FILE"
-        echo "[recovery] ✓ Nuevo grastate.dat creado"
+        echo "[recovery] safe_to_bootstrap ya está en 1"
       fi
-    done
+    else
+      cat > "$TARGET_FILE" << GRastate
+# GALERA saved state
+version: 2.1
+uuid:    00000000-0000-0000-0000-000000000000
+seqno:   -1
+safe_to_bootstrap: 1
+GRastate
+      echo "[recovery] ✓ Nuevo grastate.dat creado"
+    fi
     
-    # Ajustar permisos
-    MARIADB_UID=$(id -u mysql 2>/dev/null || echo 1001)
-    MARIADB_GID=$(id -g mysql 2>/dev/null || echo 1001)
-    chown -R "${MARIADB_UID}:${MARIADB_GID}" "$DATA_MOUNT" 2>/dev/null || true
-    chmod -R g+rwX "$DATA_MOUNT" 2>/dev/null || true
-    
-    echo "[recovery] ✓ Limpieza completada"
+    # Permisos optimizados
+    chown -R 1001:1001 "$TARGET_DIR" 2>/dev/null || true
+    echo "[recovery] ✓ Proceso completado"
   ' 2>&1 | while IFS= read -r line; do
     log "$line"
   done
   
   local exit_code=${PIPESTATUS[0]}
   if [ $exit_code -eq 0 ]; then
-    log "Ajuste de grastate.dat completado exitosamente"
+    log "✓ Ajuste de grastate.dat completado"
     return 0
   else
     log "ERROR: Falló el ajuste de grastate.dat"
@@ -365,23 +412,84 @@ fix_grastate(){
 
 delete_fix_pod(){
   log "Eliminando pod temporal..."
-  kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --ignore-not-found
+  kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
 }
 
 wait_sts_healthy(){
-  log "Esperando que ${STS}-0 esté listo..."
+  log "Esperando que ${STS}-0 esté listo (timeout: ${BOOTSTRAP_READY_TIMEOUT}s)..."
   local t=0
-  while [ $t -lt 60 ]; do
+  local max_attempts=$((BOOTSTRAP_READY_TIMEOUT/5))
+  
+  while [ $t -lt $max_attempts ]; do
     local ready
     ready=$(count_ready_pods || echo 0)
     if [ "$ready" -ge 1 ]; then 
-      log "${STS}-0 está listo"
+      log "✓ ${STS}-0 está listo"
       return 0
     fi
     sleep 5
     t=$((t+1))
   done
   log "ERROR: Timeout esperando ${STS}-0"
+  return 1
+}
+
+# Función MEJORADA para escalar a todas las réplicas
+wait_all_replicas_ready(){
+  local desired="$1"
+  log "Esperando que todas las ${desired} réplicas estén listas..."
+  
+  local t=0
+  local max_attempts=60  # 5 minutos máximo
+  
+  while [ $t -lt $max_attempts ]; do
+    local ready
+    ready=$(count_ready_pods || echo 0)
+    if [ "$ready" -eq "$desired" ]; then 
+      log "✓ Todas las ${desired} réplicas están listas"
+      return 0
+    fi
+    # Nombre del servicio (esto debe ser único por servicio o contexto)
+    service_name="mariadb-galera-dev"
+
+    # Archivo temporal único para cada servicio
+    LAST_READY_FILE="/tmp/.last_ready_notified_${service_name}"
+
+    # Leer el último valor notificado si existe, sino usar -1 (un valor imposible)
+    if [ -f "$LAST_READY_FILE" ]; then
+      last_ready=$(cat "$LAST_READY_FILE")
+    else
+      last_ready=-1
+    fi
+
+    # Obtener el valor actual de "ready"
+    ready=$(count_ready_pods || echo 0)
+
+    # Verificar si ya están todas las réplicas listas
+    if [ "$ready" -eq "$desired" ]; then
+      log "✓ Todas las ${desired} réplicas están listas"
+      return 0
+    fi
+
+    # Lógica de notificación
+    if [ "$ready" -gt 0 ] && [ "$ready" -lt "$desired" ]; then
+      if [ "$ready" -ne "$last_ready" ]; then
+        send_slack_warning "${ready}/${desired} réplicas listas"
+        echo "$ready" > "$LAST_READY_FILE"  # Guardar el valor actual de "ready"
+      fi
+    fi
+
+    # Limpiar el archivo temporal
+    # rm "$LAST_READY_FILE"
+
+    # Registro de progreso
+    log "Progreso: ${ready}/${desired} réplicas listas"
+    sleep 5
+    t=$((t+1))
+  done
+  
+  local final_ready=$(count_ready_pods || echo 0)
+  log "⚠️ Timeout: Solo ${final_ready}/${desired} réplicas listas"
   return 1
 }
 
@@ -405,15 +513,15 @@ recovery_once(){
   local start_time=$(date +%s)
   
   log "=========================================="
-  log ">>> INICIANDO RECUPERACIÓN"
+  log ">>> INICIANDO RECUPERACIÓN OPTIMIZADA"
   log "=========================================="
   
-  local replicas desired
-  replicas=$(get_replicas || echo 0)
-  desired=${replicas:-$DESIRED_REPLICAS_DEFAULT}
+  # SIEMPRE USAR 3 RÉPLICAS PARA HA - IGNORAR EL ESTADO ACTUAL
+  local desired_replicas="$DESIRED_REPLICAS"
+  log "Configurando cluster para Alta Disponibilidad: ${desired_replicas} réplicas"
   
   # Notificar inicio
-  send_slack_recovery_start "$desired"
+  send_slack_recovery_start "$desired_replicas"
   
   # Paso 1: Escalar a 0
   log "PASO 1/7: Escalando ${STS} a 0"
@@ -421,16 +529,16 @@ recovery_once(){
   scale_sts 0
   wait_delete_pods
   
-  # Paso 2: Crear pod temporal
-  log "PASO 2/7: Creando pod temporal con PVC $PVC"
-  send_slack_recovery_step "2" "7" "Creando pod temporal para acceder al volumen de datos..."
+  # Paso 2: Crear pod temporal optimizado
+  log "PASO 2/7: Creando pod temporal optimizado con PVC $PVC"
+  send_slack_recovery_step "2" "7" "Creando pod temporal optimizado para acceder al volumen de datos..."
   if ! create_fix_pod "$PVC"; then
     send_slack_recovery_failed "No se pudo crear el pod temporal"
     return 1
   fi
   
-  # Paso 3: Ajustar grastate.dat
-  log "PASO 3/7: Ajustando grastate.dat y limpiando archivos"
+  # Paso 3: Ajustar grastate.dat optimizado
+  log "PASO 3/7: Ajustando grastate.dat (optimizado)"
   send_slack_recovery_step "3" "7" "Ajustando \`grastate.dat\` (safe_to_bootstrap=1) y limpiando caché de Galera..."
   if ! fix_grastate; then
     send_slack_recovery_failed "Falló el ajuste de grastate.dat"
@@ -442,15 +550,15 @@ recovery_once(){
   log "PASO 4/7: Eliminando pod temporal"
   send_slack_recovery_step "4" "7" "Eliminando pod temporal..."
   delete_fix_pod
-  sleep 3
+  sleep 2
   
   # Paso 5: Bootstrap con 1 réplica
   log "PASO 5/7: Re-escalando ${STS} a 1 (bootstrap)"
   send_slack_recovery_step "5" "7" "Iniciando bootstrap del cluster con pod-0..."
   scale_sts 1
   
-  # Paso 6: Esperar pod-0
-  log "PASO 6/7: Esperando ${STS}-0 listo..."
+  # Paso 6: Esperar pod-0 optimizado
+  log "PASO 6/7: Esperando ${STS}-0 listo (optimizado)..."
   send_slack_recovery_step "6" "7" "Esperando que pod-0 complete el bootstrap..."
   if ! wait_sts_healthy; then
     local error_msg="${STS}-0 no quedó listo tras bootstrap"
@@ -459,23 +567,34 @@ recovery_once(){
     return 1
   fi
   
-  # Paso 7: Escalar a réplicas deseadas
-  if [ "$desired" -gt 1 ]; then
-    log "PASO 7/7: Escalando ${STS} a $desired réplicas"
-    send_slack_recovery_step "7" "7" "Escalando cluster a ${desired} réplicas..."
-    scale_sts "$desired"
-    sleep 10
+  # Paso 7: Escalar a 3 RÉPLICAS PARA HA y esperar
+  log "PASO 7/7: Escalando ${STS} a ${desired_replicas} réplicas (HA)"
+  send_slack_recovery_step "7" "7" "Escalando cluster a ${desired_replicas} réplicas para Alta Disponibilidad..."
+  scale_sts "$desired_replicas"
+  
+  # ESPERAR ACTIVAMENTE A QUE TODAS LAS RÉPLICAS ESTÉN LISTAS
+  log "Esperando que todas las ${desired_replicas} réplicas estén listas..."
+  if wait_all_replicas_ready "$desired_replicas"; then
+    log "✓ Todas las ${desired_replicas} réplicas están operativas - Cluster HA listo"
+  else
+    log "⚠️ No todas las réplicas están listas, pero el cluster está operativo"
   fi
   
   local end_time=$(date +%s)
   local duration=$((end_time - start_time))
   
+  # Verificar estado final
+  local final_ready=$(count_ready_pods)
+  local final_replicas=$(get_replicas)
+  
   log "=========================================="
   log ">>> RECUPERACIÓN COMPLETADA (${duration}s)"
+  log ">>> ESTADO FINAL: ${final_ready}/${final_replicas} réplicas listas"
+  log ">>> CLUSTER HA CONFIGURADO PARA ${desired_replicas} RÉPLICAS"
   log "=========================================="
   
   # Notificar éxito
-  send_slack_recovery_success "$desired" "$duration"
+  send_slack_recovery_success "$final_replicas" "$duration"
   
   return 0
 }
@@ -499,9 +618,22 @@ if [ "$unlock" -eq 1 ]; then
 fi
 
 # Verificar configuración mínima
-log "Iniciando MariaDB HA Watchdog"
+log "Iniciando MariaDB HA Watchdog (VERSIÓN OPTIMIZADA)"
 log "Namespace: $NS | StatefulSet: $STS | Context: $CTX"
 log "PVC: $PVC | Slack: $([ -n "$SLACK_WEBHOOK_URL" ] && echo "Enabled" || echo "Disabled")"
+log "Timeouts optimizados: Pod Creation: ${POD_CREATION_TIMEOUT}s, Pod Ready: ${POD_READY_TIMEOUT}s"
+
+# Mostrar réplicas actuales al inicio y configuración HA
+current_replicas=$(get_replicas)
+log "Réplicas actuales detectadas: ${current_replicas}"
+log "CONFIGURACIÓN HA: Siempre escalando a ${DESIRED_REPLICAS} réplicas para Alta Disponibilidad"
+ensure_minimum_replicas
+
+# Verificar dependencias
+if ! have_cmd timeout; then
+  log "ERROR: El comando 'timeout' no está disponible. Instale coreutils."
+  exit 1
+fi
 
 # --- Main loop ---
 iteration=0
@@ -540,6 +672,8 @@ while true; do
     sleep "$SLEEP_SECONDS"
     continue
   fi
+
+  ensure_minimum_replicas
   
   # Verificar si se necesita recuperación
   if should_recover || [ "$force_run" -eq 1 ]; then
@@ -548,6 +682,8 @@ while true; do
     if recovery_once; then
       clear_lock
       force_run=0
+      # Esperar un poco más después de recuperación exitosa
+      sleep 30
     else
       set_lock "cooloff"
       log "Recuperación fallida, entrando en cooldown ${COOLOFF_ON_FAIL}s."
@@ -556,10 +692,16 @@ while true; do
   else
     # Log periódico cuando todo está OK (cada 20 iteraciones = ~10 minutos)
     if [ $((iteration % 20)) -eq 0 ]; then
-      local ready=$(count_ready_pods)
-      local replicas=$(get_replicas)
+      ensure_minimum_replicas
+      ready=$(count_ready_pods)
+      replicas=$(get_replicas)
       log "Cluster OK (${ready}/${replicas} Ready)"
+      # Si hay menos réplicas de las deseadas, log warning
+      if [ "$replicas" -lt "$DESIRED_REPLICAS" ]; then
+        log "⚠️  ADVERTENCIA: Cluster con solo ${replicas} réplicas (se esperaban ${DESIRED_REPLICAS} para HA)"
+      fi
     fi
     sleep "$SLEEP_SECONDS"
   fi
 done
+
