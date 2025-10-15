@@ -89,22 +89,25 @@ Detectar caídas totales del cluster MariaDB/Galera (todos los pods caídos) y r
 
 ## Variables configurables (variables de entorno)
 
-| Variable                 | Descripción                                                     | Valor por defecto                                    |
-|-------------------------|-----------------------------------------------------------------|----------------------------------------------------|
-| `NS`                    | Namespace donde está el StatefulSet                              | `nextcloud`                                        |
-| `STS`                   | Nombre del StatefulSet                                           | `mariadb`                                          |
-| `CTX`                   | Contexto de Kubernetes (`kubectl --context`) **REQUIRED**       | *Ninguno* (el script falla si no está definido)    |
-| `DATA_DIR`              | Directorio donde se monta el volumen de datos                   | `/var/lib/mysql`                                   |
-| `FIX_IMAGE`             | Imagen Docker para el pod temporal de reparación                | `tanzu-harbor.pngd.gob.pe/mef-ped-prod/mariadb:10.6` |
-| `SLEEP_SECONDS`         | Intervalo entre chequeos del watchdog (segundos)                | `30`                                               |
-| `LOCK_FILE`             | Archivo para lock                                                 | `/tmp/ha-watchdog-XXXXXX/watchdog.lock`            |
-| `LOCK_TTL`              | Tiempo máximo para lock en estado "cooloff" (segundos)          | `600`                                              |
-| `COOLOFF_ON_FAIL`       | Tiempo de espera tras recuperación fallida (segundos)           | `90`                                               |
-| `RUNNING_STALE`         | Tiempo para limpiar lock "running" colgado (segundos)           | `300`                                              |
-| `WAIT_POD_DELETE_TIMEOUT` | Timeout para esperar eliminación de pods                       | `180s`                                             |
-| `WAIT_FIX_READY_TIMEOUT` | Timeout para esperar pod temporal listo                         | `180s`                                             |
-| `WAIT_STS_READY_TIMEOUT` | Timeout para esperar mariadb-0 listo                            | `300s`                                             |
-| `DESIRED_REPLICAS_DEFAULT` | Réplicas por defecto si no se detecta valor en StatefulSet    | `3`                                                |
+| Variable                 | Descripción                                                     | Valor por defecto                                             |
+|-------------------------|-----------------------------------------------------------------|---------------------------------------------------------------|
+| `NS`                    | Namespace donde está el StatefulSet                              | `nextcloud`                                                   |
+| `STS`                   | Nombre del StatefulSet                                           | `mariadb`                                                     |
+| `CTX`                   | Contexto de Kubernetes (`kubectl --context`) **REQUIRED**       | *Ninguno* (el script termina si no está definido)             |
+| `PVC`                   | PVC principal del pod `STS-0`                                    | *Requerido* (sin valor el script aborta)                      |
+| `DATA_DIR`              | Directorio donde se monta el PVC en el pod temporal              | `/bitnami/mariadb`                                            |
+| `FIX_IMAGE`             | Imagen Docker para el pod temporal de reparación                | `tanzu-harbor.pngd.gob.pe/pcm/mariadb-galera:12.0.2-debian-12-r0` |
+| `SLEEP_SECONDS`         | Intervalo entre chequeos del watchdog (segundos)                | `30`                                                          |
+| `TMP_DIR`               | Directorio temporal base para locks                             | `mktemp -d -t ha-watchdog-XXXXXX`                             |
+| `LOCK_FILE`             | Archivo lock (`ts/state`)                                        | `${TMP_DIR}/watchdog.lock`                                    |
+| `LOCK_TTL`              | Tiempo máximo para lock en estado "cooloff" (segundos)          | `600`                                                         |
+| `COOLOFF_ON_FAIL`       | Tiempo de espera tras recuperación fallida (segundos)           | `90`                                                          |
+| `RUNNING_STALE`         | Tiempo para limpiar lock "running" colgado (segundos)           | `300`                                                         |
+| `WAIT_POD_DELETE_TIMEOUT` | Timeout para esperar eliminación de pods                       | `180s`                                                        |
+| `WAIT_FIX_READY_TIMEOUT` | Timeout para esperar pod temporal listo                         | `180s`                                                        |
+| `WAIT_STS_READY_TIMEOUT` | Timeout para esperar `STS-0` listo                              | `300s`                                                        |
+| `DESIRED_REPLICAS_DEFAULT` | Réplicas por defecto si no se detecta valor en StatefulSet    | `3`                                                           |
+| `SLACK_WEBHOOK_URL`     | Webhook para notificaciones de Slack (opcional)                 | *Vacío* (no envía alertas si no se define)                    |
 
 ---
 
@@ -120,6 +123,22 @@ CTX=wso2-prod-tpm NS=wso2 STS=mariadb ./mariadb-ha-watchdog.sh
 # Forzar ejecución ignorando lock
 ./mariadb-ha-watchdog.sh --force
 ```
+
+### Notificaciones a Slack
+
+Si configuras `SLACK_WEBHOOK_URL`, el watchdog enviará cada mensaje de log al canal (incluidos los pasos de diagnóstico y recuperación). Recomendado exportar la variable junto con otras credenciales:
+
+```bash
+export CTX=mi-contexto-k8s
+export NS=mi-namespace
+export STS=mariadb
+export PVC=data-mariadb-0
+export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/XXXXXXXX
+./mariadb-ha-watchdog.sh
+```
+
+- Autoajuste de réplicas: si detecta menos réplicas configuradas que las requeridas por HA, escala de inmediato el StatefulSet al mínimo (`DESIRED_REPLICAS`, por defecto 3) y notifica la acción.
+- Tras autoescalar, espera a que las réplicas queden Ready; reporta el éxito o advierte por Slack si no se logra el estado deseado a tiempo.
 
 ## Instalar servicio systemd
 

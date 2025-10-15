@@ -453,7 +453,7 @@ wait_all_replicas_ready(){
     service_name="mariadb-galera-dev"
 
     # Archivo temporal único para cada servicio
-    LAST_READY_FILE="/tmp/.last_ready_notified_${service_name}"
+    LAST_READY_FILE="/tmp/.last_ready_notified_${CTX}_${NS}_${STS}"
 
     # Leer el último valor notificado si existe, sino usar -1 (un valor imposible)
     if [ -f "$LAST_READY_FILE" ]; then
