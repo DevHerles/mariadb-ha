@@ -126,3 +126,4 @@ CTX=wso2-prod-tpm NS=wso2 STS=mariadb ./mariadb-ha-watchdog.sh
 ```bash
 ./install-service.sh
 ```
+
