@@ -235,7 +235,11 @@ ensure_minimum_replicas(){
   current=$(get_replicas || echo 0)
   if [ "$current" -lt "$desired" ]; then
     log "Réplicas configuradas (${current}) por debajo del mínimo HA (${desired}); escalando inmediatamente."
-    send_slack_warning "Se detectaron ${current} réplicas configuradas en ${NS}/${STS}. Forzando escalado a ${desired} para mantener Alta Disponibilidad."
+    if [ "$current" -eq 0 ]; then 
+      send_slack_critical "Se detectaron ${current} réplicas configuradas en ${NS}/${STS}. Forzando escalado a ${desired} para mantener Alta Disponibilidad."
+    else
+      send_slack_warning "Se detectaron ${current} réplicas configuradas en ${NS}/${STS}. Forzando escalado a ${desired} para mantener Alta Disponibilidad."
+    fi
     scale_sts "$desired"
     scaled=1
   fi
@@ -704,4 +708,5 @@ while true; do
     sleep "$SLEEP_SECONDS"
   fi
 done
+
 
