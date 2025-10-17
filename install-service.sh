@@ -145,12 +145,8 @@ sed -e "s|Description=.*|Description=$DESCRIPTION|" \
     -e "s|Environment=STS=<.*>|Environment=STS=$STS|" \
     -e "s|Environment=CTX=<.*>|Environment=CTX=$CTX|" \
     -e "s|Environment=PVC=<.*>|Environment=PVC=$PVC|" \
+    -e "s|Environment=SLACK_WEBHOOK_URL=<.*>|Environment=SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL|" \
     "$SERVICE_FILE" > "$TEMP_SERVICE"
-
-# Append Slack webhook environment if provided
-if [ -n "$SLACK_WEBHOOK_URL" ]; then
-    echo "Environment=SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL" >> "$TEMP_SERVICE"
-fi
 
 # Copy configured service file
 log_info "Installing systemd service to $DEST_SERVICE..."
@@ -191,3 +187,4 @@ else
     log_error "Service failed to start. Check logs with: journalctl -u mariadb-ha-watchdog-$NS-$STS-$CTX.service -n 50"
     exit 1
 fi
+
