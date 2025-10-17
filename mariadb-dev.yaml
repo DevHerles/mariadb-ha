@@ -45,6 +45,15 @@ resources:
   limits:
     cpu: "512m"
     memory: "2Gi"
+  vpa:
+    enabled: true                   # Permite que el pod primario escale recursos automáticamente
+    updateMode: Auto                # Ajusta CPU/RAM sin intervención manual
+    minAllowed:
+      cpu: "512m"
+      memory: "2Gi"
+    maxAllowed:
+      cpu: "6000m"
+      memory: "12Gi"
 
 # Configuración de Backups
 backup:
@@ -67,3 +76,4 @@ cleanup:
   deleteStorageClass: true           # Eliminar StorageClass creado
   deletePullSecret: false            # Mantener el pull secret
   force: false                       # Saltar confirmación interactiva
+

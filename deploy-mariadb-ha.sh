@@ -23,6 +23,12 @@ GALERA_BOOTSTRAP_NODE=""
 GALERA_FORCE_SAFE_BOOTSTRAP="false"
 HELM_RELEASE_EXISTS="false"
 IS_FIRST_DEPLOYMENT="false"
+VPA_ENABLED="true"
+VPA_UPDATE_MODE="Auto"
+VPA_MIN_CPU=""
+VPA_MIN_MEM=""
+VPA_MAX_CPU=""
+VPA_MAX_MEM=""
 
 # Función para logging
 log_info() {
@@ -129,7 +135,7 @@ parse_config() {
     # Leer variables usando yq
     DEPLOYMENT_NAME=$(yq eval '.deployment.name' "$config_file")
     NAMESPACE=$(yq eval '.deployment.namespace' "$config_file")
-    HELM_SECRET_NAME="${DEPLOYMENT_NAME}-mariadb-galera"
+    HELM_SECRET_NAME="${DEPLOYMENT_NAME}"
     CHART_VERSION=$(yq eval '.deployment.chartVersion // "latest"' "$config_file")
     
     # Storage
@@ -160,6 +166,28 @@ parse_config() {
     MEM_REQUEST=$(yq eval '.resources.requests.memory // "2Gi"' "$config_file")
     CPU_LIMIT=$(yq eval '.resources.limits.cpu // "2000m"' "$config_file")
     MEM_LIMIT=$(yq eval '.resources.limits.memory // "4Gi"' "$config_file")
+    
+    # Vertical Pod Autoscaler
+    VPA_ENABLED=$(to_bool "$(yq eval '.resources.vpa.enabled // false' "$config_file")")
+    VPA_UPDATE_MODE=$(yq eval '.resources.vpa.updateMode // "Auto"' "$config_file")
+    VPA_MIN_CPU=$(yq eval '.resources.vpa.minAllowed.cpu // ""' "$config_file")
+    VPA_MIN_MEM=$(yq eval '.resources.vpa.minAllowed.memory // ""' "$config_file")
+    VPA_MAX_CPU=$(yq eval '.resources.vpa.maxAllowed.cpu // ""' "$config_file")
+    VPA_MAX_MEM=$(yq eval '.resources.vpa.maxAllowed.memory // ""' "$config_file")
+    
+    # Defaults for VPA min/max if not provided
+    if [[ -z "$VPA_MIN_CPU" || "$VPA_MIN_CPU" == "null" ]]; then
+        VPA_MIN_CPU="$CPU_REQUEST"
+    fi
+    if [[ -z "$VPA_MIN_MEM" || "$VPA_MIN_MEM" == "null" ]]; then
+        VPA_MIN_MEM="$MEM_REQUEST"
+    fi
+    if [[ -z "$VPA_MAX_CPU" || "$VPA_MAX_CPU" == "null" ]]; then
+        VPA_MAX_CPU="$CPU_LIMIT"
+    fi
+    if [[ -z "$VPA_MAX_MEM" || "$VPA_MAX_MEM" == "null" ]]; then
+        VPA_MAX_MEM="$MEM_LIMIT"
+    fi
     
     # Backup
     BACKUP_ENABLED=$(yq eval '.backup.enabled // false' "$config_file")
@@ -605,6 +633,19 @@ resources:
     memory: "$MEM_LIMIT"
     cpu: "$CPU_LIMIT"
 
+verticalPodAutoscaler:
+  enabled: $VPA_ENABLED
+  updateMode: "$VPA_UPDATE_MODE"
+  controlledResources:
+    - cpu
+    - memory
+  minAllowed:
+    cpu: "$VPA_MIN_CPU"
+    memory: "$VPA_MIN_MEM"
+  maxAllowed:
+    cpu: "$VPA_MAX_CPU"
+    memory: "$VPA_MAX_MEM"
+
 ## Persistencia
 persistence:
   enabled: true
@@ -748,6 +789,12 @@ EOF
     else
         log_info "   → Configurado para CLUSTER EXISTENTE"
     fi
+    
+    if [[ "$VPA_ENABLED" == "true" ]]; then
+        log_info "   → Vertical Pod Autoscaler habilitado (min: CPU $VPA_MIN_CPU / MEM $VPA_MIN_MEM, max: CPU $VPA_MAX_CPU / MEM $VPA_MAX_MEM)"
+    else
+        log_info "   → Vertical Pod Autoscaler deshabilitado (puede activarse via resources.vpa.enabled)"
+    fi
 }
 
 # Función para instalar/actualizar Helm Chart
@@ -802,22 +849,41 @@ verify_deployment() {
     
     # Esperar a que todos los pods estén listos
     log_info "Esperando a que los pods estén listos..."
-    kubectl wait --for=condition=ready pod \
-        -l app.kubernetes.io/name=mariadb-galera,app.kubernetes.io/instance="$DEPLOYMENT_NAME" \
+    local label_selector="app.kubernetes.io/name=mariadb-galera,app.kubernetes.io/instance=$DEPLOYMENT_NAME"
+    if ! kubectl wait --for=condition=ready pod \
+        -l "$label_selector" \
         -n "$NAMESPACE" \
-        --timeout=600s || {
-            log_error "Timeout esperando pods ready. Mostrando logs del pod-0..."
-            kubectl logs -n "$NAMESPACE" "${DEPLOYMENT_NAME}-mariadb-galera-0" --tail=50
-            return 1
-        }
+        --timeout=600s; then
+        log_error "Timeout esperando pods ready. Mostrando información de diagnóstico..."
+        kubectl get pods -n "$NAMESPACE" -l "$label_selector" -o wide || true
+        kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -n 20 || true
+        local first_pod
+        first_pod=$(kubectl get pods -n "$NAMESPACE" -l "$label_selector" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort | head -n1)
+        if [[ -n "$first_pod" ]]; then
+            log_warn "Intentando obtener logs de $first_pod..."
+            kubectl logs -n "$NAMESPACE" "$first_pod" --tail=100 || true
+        else
+            log_warn "No se encontraron pods para el selector $label_selector."
+        fi
+        return 1
+    fi
     
     # Mostrar estado de los pods
     log_info "Estado de los pods:"
-    kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/instance="$DEPLOYMENT_NAME"
+    kubectl get pods -n "$NAMESPACE" -l "$label_selector"
+    
+    local primary_pod
+    primary_pod=$(kubectl get pods -n "$NAMESPACE" -l "$label_selector" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort | head -n1)
+    if [[ -z "$primary_pod" ]]; then
+        log_warn "No se pudo determinar el pod principal para verificaciones adicionales."
+        return 0
+    fi
     
     # Verificar cluster size
     log_info "Verificando tamaño del cluster Galera..."
-    local cluster_size=$(kubectl exec -n "$NAMESPACE" "${DEPLOYMENT_NAME}-mariadb-galera-0" -- \
+    local cluster_size=$(kubectl exec -n "$NAMESPACE" "$primary_pod" -- \
         mysql -uroot -p"$ROOT_PASSWORD" -e "SHOW STATUS LIKE 'wsrep_cluster_size';" -sN | awk '{print $2}')
     
     log_info "Cluster size: $cluster_size / $REPLICA_COUNT"
@@ -848,7 +914,7 @@ show_connection_info() {
     echo "Primer Despliegue: $IS_FIRST_DEPLOYMENT"
     echo ""
     
-    local service_base="${DEPLOYMENT_NAME}-mariadb-galera"
+    local service_base="${DEPLOYMENT_NAME}"
     
     echo "Servicio de escritura/lectura:"
     echo "  ${service_base}.${NAMESPACE}.svc.cluster.local:3306"
@@ -978,6 +1044,64 @@ EOF
     log_info "✓ CronJob de backup creado"
 }
 
+create_or_update_vpa() {
+    if [[ "$VPA_ENABLED" != "true" ]]; then
+        log_info "VPA deshabilitado en configuración; omitiendo creación de Vertical Pod Autoscaler."
+        return
+    fi
+
+    if ! kubectl api-resources 2>/dev/null | grep -qi "^verticalpodautoscalers"; then
+        log_warn "Cluster sin soporte para Vertical Pod Autoscaler (CRD no disponible). Intentando instalar componentes requeridos..."
+        local vpa_crd_url="https://raw.githubusercontent.com/kubernetes/autoscaler/vpa-release-1.0/vertical-pod-autoscaler/deploy/vpa-v1-crd-gen.yaml"
+        local vpa_rbac_url="https://raw.githubusercontent.com/kubernetes/autoscaler/vpa-release-1.0/vertical-pod-autoscaler/deploy/vpa-rbac.yaml"
+
+        if kubectl apply -f "$vpa_crd_url" && kubectl apply -f "$vpa_rbac_url"; then
+            log_info "✓ Recursos de VPA instalados. Esperando a que el API los registre..."
+            sleep 5
+        else
+            log_warn "No se pudieron aplicar los manifiestos de VPA. Verifica conectividad y permisos."
+        fi
+    fi
+
+    if ! kubectl api-resources 2>/dev/null | grep -qi "^verticalpodautoscalers"; then
+        log_warn "Vertical Pod Autoscaler sigue sin estar disponible en el cluster. Omite creación automática."
+        return
+    fi
+
+    local vpa_name="${DEPLOYMENT_NAME}-vpa"
+    local sts_name="${DEPLOYMENT_NAME}-mariadb-galera"
+
+    log_info "Aplicando Vertical Pod Autoscaler ($vpa_name) apuntando a $sts_name..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: $vpa_name
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: mariadb-galera
+    app.kubernetes.io/instance: $DEPLOYMENT_NAME
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: $sts_name
+  updatePolicy:
+    updateMode: "$VPA_UPDATE_MODE"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: mariadb-galera
+      minAllowed:
+        cpu: "$VPA_MIN_CPU"
+        memory: "$VPA_MIN_MEM"
+      maxAllowed:
+        cpu: "$VPA_MAX_CPU"
+        memory: "$VPA_MAX_MEM"
+EOF
+
+    log_info "✓ VPA aplicado correctamente (min: CPU $VPA_MIN_CPU / MEM $VPA_MIN_MEM, max: CPU $VPA_MAX_CPU / MEM $VPA_MAX_MEM)"
+}
+
 # Función principal
 main() {
     local config_file="mariadb-config.yaml"
@@ -1025,6 +1149,7 @@ main() {
     create_storage_class
     generate_values
     deploy_mariadb
+    create_or_update_vpa
     
     # Crear ConfigMap de estado después del primer despliegue exitoso
     if [[ "$IS_FIRST_DEPLOYMENT" == "true" ]]; then
