@@ -28,6 +28,7 @@ OPTIONS:
     -c, --context CTX           Kubernetes context (required)
     -p, --pvc PVC               PVC name (required)
     -d, --description DESC      Service description (optional, default: "MariaDB Galera HA Watchdog")
+    -w, --slack-webhook URL     Slack webhook URL (optional)
     -h, --help                  Show this help message
 
 EXAMPLE:
@@ -43,6 +44,7 @@ STS=""
 CTX=""
 PVC=""
 DESCRIPTION="MariaDB Galera HA Watchdog"
+SLACK_WEBHOOK_URL=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--description)
             DESCRIPTION="$2"
+            shift 2
+            ;;
+        -w|--slack-webhook)
+            SLACK_WEBHOOK_URL="$2"
             shift 2
             ;;
         -h|--help)
@@ -107,6 +113,7 @@ log_info "  StatefulSet:  $STS"
 log_info "  Context:      $CTX"
 log_info "  PVC:          $PVC"
 log_info "  Description:  $DESCRIPTION"
+log_info "  Slack Webhook:${SLACK_WEBHOOK_URL:-<none>}"
 
 # Check if source files exist
 if [ ! -f "$WATCHDOG_SCRIPT" ]; then
@@ -139,6 +146,11 @@ sed -e "s|Description=.*|Description=$DESCRIPTION|" \
     -e "s|Environment=CTX=<.*>|Environment=CTX=$CTX|" \
     -e "s|Environment=PVC=<.*>|Environment=PVC=$PVC|" \
     "$SERVICE_FILE" > "$TEMP_SERVICE"
+
+# Append Slack webhook environment if provided
+if [ -n "$SLACK_WEBHOOK_URL" ]; then
+    echo "Environment=SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL" >> "$TEMP_SERVICE"
+fi
 
 # Copy configured service file
 log_info "Installing systemd service to $DEST_SERVICE..."
@@ -179,5 +191,3 @@ else
     log_error "Service failed to start. Check logs with: journalctl -u mariadb-ha-watchdog-$NS-$STS-$CTX.service -n 50"
     exit 1
 fi
-
-
