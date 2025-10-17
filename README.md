@@ -143,6 +143,55 @@ export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/XXXXXXXX
 ## Instalar servicio systemd
 
 ```bash
-./install-service.sh
+sudo ./install-service.sh \
+  -n database-dev \
+  -s mariadb-galera-dev \
+  -p data-mariadb-galera-dev-0 \
+  -c wso2-prod-tmp \
+  -w https://hooks.slack.com/services/T00000/XXXXXXXXX/XXXXXXXXXXXXXX \
+  -d "MariaDB Galera HA Watchdog (WSO2 - DEV)"
 ```
+
+### Comandos útiles
+
+- Ver servicios watchdog en ejecución  
+  `systemctl list-units --type=service --state=running | grep watchdog`
+- Revisar estado puntual del servicio  
+  `systemctl status mariadb-ha-watchdog-database-dev-mariadb-galera-dev-wso2-prod-tmp.service`
+- Seguir logs en vivo  
+  `journalctl -u mariadb-ha-watchdog-database-dev-mariadb-galera-dev-wso2-prod-tmp.service -f`
+- Reinstalar con nuevos parámetros  
+  `sudo ./install-service.sh ...` (usar flags anteriores)
+- Desinstalar (detiene, deshabilita y elimina el unit)  
+  `sudo ./uninstall-watchdog-service.sh -n database-dev -s mariadb-galera-dev -c wso2-prod-tmp [-b]`
+
+El flag opcional `-b` elimina también `/usr/local/bin/mariadb-ha-watchdog.sh` siempre que no
+queden otros servicios watchdog registrados en la máquina.
+
+### Desinstalación completa del servicio watchdog
+
+```bash
+sudo ./uninstall-watchdog-service.sh \
+  -n database-dev \
+  -s mariadb-galera-dev \
+  -c wso2-prod-tmp \
+  -b
+```
+
+Acciones realizadas:
+
+- Detiene y deshabilita `mariadb-ha-watchdog-<ns>-<sts>-<ctx>.service`.
+- Elimina el unit file de `/etc/systemd/system/`.
+- Recarga el daemon de systemd.
+- (Opcional, `-b`) borra `/usr/local/bin/mariadb-ha-watchdog.sh` si no quedan otros servicios watchdog instalados.
+
+Antes de ejecutar la desinstalación, puedes comprobar los servicios activos con:
+
+```bash
+systemctl list-units --type=service --state=running | grep watchdog
+```
+
+> Nota: Los comandos anteriores asumen que el servicio se generó con el patrón
+> `mariadb-ha-watchdog-<namespace>-<statefulset>-<context>.service`. Ajusta los
+> nombres según tu despliegue.
 
