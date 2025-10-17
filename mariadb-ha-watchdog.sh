@@ -34,7 +34,7 @@ BOOTSTRAP_READY_TIMEOUT="${BOOTSTRAP_READY_TIMEOUT:-120}"
 TMP_DIR="${TMP_DIR:-$(mktemp -d -t ha-watchdog-XXXXXX)}"
 LOCK_FILE="${LOCK_FILE:-${TMP_DIR}/watchdog.lock}"
 LOCK_TTL="${LOCK_TTL:-600}"
-COOLOFF_ON_FAIL="${COOLOFF_ON_FAIL:-90}"
+COOLOFF_ON_FAIL="${COOLOFF_ON_FAIL:-30}"
 RUNNING_STALE="${RUNNING_STALE:-300}"
 # FORZAR 3 RÉPLICAS PARA HA - SIEMPRE
 DESIRED_REPLICAS="${DESIRED_REPLICAS:-3}"
@@ -229,6 +229,15 @@ count_ready_pods(){
   fi
 }
 
+is_cluster_healthy(){
+  local ready="${1:-0}"
+  local desired="${2:-$DESIRED_REPLICAS}"
+  if [ "$ready" -ge "$desired" ]; then
+    return 0
+  fi
+  return 1
+}
+
 ensure_minimum_replicas(){
   local desired="$DESIRED_REPLICAS"
   local current scaled=0
@@ -256,6 +265,39 @@ ensure_minimum_replicas(){
   fi
 }
 
+handle_force_mode(){
+  local ready replicas
+  ready=$(count_ready_pods || echo 0)
+  replicas=$(get_replicas || echo 0)
+  local initial="${ORIGINAL_REPLICAS:-$replicas}"
+
+  if is_cluster_healthy "$ready" "$DESIRED_REPLICAS"; then
+    if [ "$initial" -eq 0 ]; then
+      log "Escalado previo exitoso detectado (${ready}/${DESIRED_REPLICAS} Ready). No se ejecutará recuperación forzada."
+      send_slack_info "Escalado exitoso, recuperación cancelada en ${NS}/${STS} (modo --force)."
+    else
+      log "Cluster ya saludable detectado con --force (${ready}/${DESIRED_REPLICAS} Ready); no se realizarán cambios."
+      send_slack_info "Cluster ya saludable, no se realizaron cambios (modo --force) en ${NS}/${STS}."
+    fi
+    return 0
+  fi
+
+  if [ "$replicas" -eq 0 ] && [ "$ready" -eq 0 ]; then
+    log "Cluster en 0 réplicas detectado con --force. Intentando escalado mínimo antes de recuperación completa..."
+    ensure_minimum_replicas
+    ready=$(count_ready_pods || echo 0)
+    replicas=$(get_replicas || echo 0)
+    if is_cluster_healthy "$ready" "$DESIRED_REPLICAS"; then
+      log "Escalado mínimo exitoso (${ready}/${DESIRED_REPLICAS} Ready). Cancelando recuperación forzada."
+      send_slack_info "Escalado exitoso, recuperación cancelada en ${NS}/${STS} (modo --force)."
+      return 0
+    fi
+    log "Escalado mínimo no restauró el cluster (Ready: ${ready}/${DESIRED_REPLICAS}). Continuando con recuperación forzada."
+  fi
+
+  return 1
+}
+
 wait_delete_pods(){
   log "Eliminación rápida de pods..."
   
@@ -279,15 +321,47 @@ wait_delete_pods(){
 
 create_fix_pod(){
   local pvc_name="$1"
-  log "Creando pod temporal optimizado..."
+  local max_retries=3
+  local retry_count=0
   
-  # Pre-crear el pod de forma asíncrona
-  kubectl -n "$NS" --context="$CTX" apply -f - <<EOF >/dev/null 2>&1 &
+  # ============================================================================
+  # PASO 1: Validar que el PVC existe ANTES de crear el pod
+  # ============================================================================
+  log "Validando existencia del PVC: ${pvc_name}"
+  if ! kubectl -n "$NS" --context="$CTX" get pvc "${pvc_name}" >/dev/null 2>&1; then
+    log "ERROR: El PVC '${pvc_name}' NO EXISTE en el namespace ${NS}"
+    log "PVCs disponibles:"
+    kubectl -n "$NS" --context="$CTX" get pvc -o name
+    send_slack_critical "PVC \`${pvc_name}\` no encontrado en ${NS}. Verifica la configuración."
+    return 1
+  fi
+  log "✓ PVC ${pvc_name} existe"
+  
+  # ============================================================================
+  # PASO 2: Limpiar cualquier pod residual
+  # ============================================================================
+  if kubectl -n "$NS" --context="$CTX" get pod/mariadb-fix >/dev/null 2>&1; then
+    log "Eliminando pod temporal residual..."
+    kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+    sleep 3
+  fi
+  
+  # ============================================================================
+  # PASO 3: Crear el pod con reintentos y validación
+  # ============================================================================
+  while [ $retry_count -lt $max_retries ]; do
+    log "Intento $((retry_count + 1))/${max_retries}: Creando pod temporal..."
+    
+    # Crear el pod
+    if ! kubectl -n "$NS" --context="$CTX" apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
   name: mariadb-fix
   namespace: ${NS}
+  labels:
+    app: mariadb-fix
+    purpose: pvc-repair
 spec:
   restartPolicy: Never
   securityContext:
@@ -311,39 +385,149 @@ spec:
       requests:
         cpu: 50m
         memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
   priorityClassName: system-node-critical
   volumes:
   - name: data
     persistentVolumeClaim:
       claimName: ${pvc_name}
 EOF
+    then
+      log "ERROR: Falló la creación del pod YAML"
+      ((retry_count++))
+      sleep 3
+      continue
+    fi
+    
+    # ========================================================================
+    # PASO 4: Esperar a que el pod se cree en la API
+    # ========================================================================
+    log "Esperando creación del pod en la API (${POD_CREATION_TIMEOUT}s timeout)..."
+    if ! timeout "${POD_CREATION_TIMEOUT}s" bash -c "
+      until kubectl -n '$NS' --context='$CTX' get pod/mariadb-fix >/dev/null 2>&1; do
+        sleep 1
+      done
+    "; then
+      log "ERROR: Timeout esperando creación del pod"
+      ((retry_count++))
+      sleep 3
+      continue
+    fi
+    log "✓ Pod creado en la API"
+    
+    # ========================================================================
+    # PASO 5: Dar tiempo a Kubernetes para procesar el spec y validar PVC
+    # ========================================================================
+    sleep 5
+    
+    log "Validando PVC asignado al pod..."
+    local assigned_pvc=$(kubectl -n "$NS" --context="$CTX" get pod mariadb-fix \
+      -o jsonpath='{.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}' 2>/dev/null)
+    
+    if [ -z "$assigned_pvc" ]; then
+      log "ERROR: No se pudo obtener el PVC asignado"
+      kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+      ((retry_count++))
+      sleep 3
+      continue
+    fi
+    
+    log "PVC esperado: ${pvc_name}"
+    log "PVC asignado: ${assigned_pvc}"
+    
+    # ========================================================================
+    # PASO 6: Verificar que el PVC asignado es el CORRECTO
+    # ========================================================================
+    if [ "$assigned_pvc" != "$pvc_name" ]; then
+      log "ERROR: PVC incorrecto asignado: '${assigned_pvc}' != '${pvc_name}'"
+      send_slack_warning "Pod temporal con PVC incorrecto. Esperado: \`${pvc_name}\`, Asignado: \`${assigned_pvc}\`. Reintentando..."
+      kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+      sleep 3
+      ((retry_count++))
+      continue
+    fi
+    log "✓ PVC correcto asignado: ${assigned_pvc}"
+    
+    # ========================================================================
+    # PASO 7: Verificar que NO hay eventos de error de scheduling
+    # ========================================================================
+    sleep 3
+    log "Verificando eventos del pod..."
+    if kubectl -n "$NS" --context="$CTX" get events \
+      --field-selector involvedObject.name=mariadb-fix \
+      --sort-by='.lastTimestamp' 2>/dev/null | grep -iE "not found|failed.*pvc" >/dev/null 2>&1; then
+      log "ERROR: Detectados eventos de fallo relacionados con PVC"
+      kubectl -n "$NS" --context="$CTX" get events \
+        --field-selector involvedObject.name=mariadb-fix \
+        --sort-by='.lastTimestamp' | tail -5
+      kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+      ((retry_count++))
+      sleep 3
+      continue
+    fi
+    log "✓ No hay eventos de error"
+    
+    # ========================================================================
+    # PASO 8: Esperar a que el pod esté Ready
+    # ========================================================================
+    log "Esperando que pod esté Ready (${POD_READY_TIMEOUT}s timeout)..."
+    if kubectl -n "$NS" --context="$CTX" wait --for=condition=Ready pod/mariadb-fix \
+      --timeout="${POD_READY_TIMEOUT}s" >/dev/null 2>&1; then
+      log "✓ Pod temporal listo"
+      
+      # ====================================================================
+      # PASO 9: Verificación FINAL del PVC montado
+      # ====================================================================
+      local final_pvc=$(kubectl -n "$NS" --context="$CTX" get pod mariadb-fix \
+        -o jsonpath='{.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}')
+      log "Verificación final - PVC montado: ${final_pvc}"
+      
+      if [ "$final_pvc" = "$pvc_name" ]; then
+        log "✓✓✓ Pod creado exitosamente con PVC correcto: ${pvc_name}"
+        send_slack_info "Pod temporal creado exitosamente con PVC \`${pvc_name}\`"
+        return 0
+      else
+        log "ERROR: PVC final incorrecto después de estar Ready"
+        send_slack_warning "Pod quedó Ready pero con PVC incorrecto: \`${final_pvc}\` != \`${pvc_name}\`"
+        kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+        ((retry_count++))
+        sleep 3
+        continue
+      fi
+    else
+      log "ERROR: Pod no quedó Ready en el tiempo esperado"
+      log "Estado del pod:"
+      kubectl -n "$NS" --context="$CTX" describe pod mariadb-fix 2>/dev/null | tail -20
+      
+      # Verificar si es problema de PVC no encontrado
+      if kubectl -n "$NS" --context="$CTX" get events \
+        --field-selector involvedObject.name=mariadb-fix 2>/dev/null | \
+        grep -i "persistentvolumeclaim.*not found" >/dev/null 2>&1; then
+        log "ERROR CRÍTICO: El PVC sigue sin encontrarse después de validaciones"
+        send_slack_critical "PVC \`${pvc_name}\` no puede ser montado por el scheduler. Verifica el estado del PV/PVC."
+        kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+        return 1
+      fi
+      
+      kubectl -n "$NS" --context="$CTX" delete pod mariadb-fix --force --grace-period=0 >/dev/null 2>&1 || true
+      ((retry_count++))
+      sleep 3
+    fi
+  done
   
-  local creation_pid=$!
+  # ============================================================================
+  # FALLO DESPUÉS DE TODOS LOS REINTENTOS
+  # ============================================================================
+  log "ERROR: Fallaron todos los intentos (${max_retries}) de crear el pod"
+  log "Debug final - PVCs en el namespace:"
+  kubectl -n "$NS" --context="$CTX" get pvc
+  log "Debug final - Estado del último pod (si existe):"
+  kubectl -n "$NS" --context="$CTX" describe pod mariadb-fix 2>/dev/null | tail -30 || true
   
-  # Esperar creación con timeout reducido
-  log "Esperando creación del pod (${POD_CREATION_TIMEOUT}s)..."
-  if timeout "${POD_CREATION_TIMEOUT}s" bash -c "
-    until kubectl -n '$NS' --context='$CTX' get pod/mariadb-fix >/dev/null 2>&1; do
-      sleep 1
-    done
-  "; then
-    log "✓ Pod creado exitosamente"
-    wait $creation_pid 2>/dev/null
-  else
-    log "ERROR: Timeout en creación del pod"
-    kill $creation_pid 2>/dev/null 2>&1
-    return 1
-  fi
-  
-  # Esperar readiness optimizado
-  log "Esperando que pod temporal esté listo..."
-  if kubectl -n "$NS" --context="$CTX" wait --for=condition=Ready pod/mariadb-fix --timeout="${POD_READY_TIMEOUT}s" >/dev/null 2>&1; then
-    log "✓ Pod temporal listo en ${POD_READY_TIMEOUT}s"
-    return 0
-  else
-    log "ERROR: Pod temporal no quedó listo en el tiempo esperado"
-    return 1
-  fi
+  send_slack_critical "Falló la creación del pod temporal después de ${max_retries} intentos. PVC: \`${pvc_name}\`. Se requiere intervención manual."
+  return 1
 }
 
 fix_grastate(){
@@ -431,6 +615,23 @@ wait_sts_healthy(){
       log "✓ ${STS}-0 está listo"
       return 0
     fi
+    if kubectl -n "$NS" --context="$CTX" get pod "${STS}-0" >/dev/null 2>&1; then
+      phase=$(kubectl -n "$NS" --context="$CTX" get pod "${STS}-0" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+      if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ]; then
+        log "✓ ${STS}-0 se encuentra en fase ${phase}"
+        return 0
+      fi
+      log "Estado actual ${STS}-0: ${phase:-desconocido}"
+    else
+      log "${STS}-0 aún no existe, iniciando fixpod preventivo..."
+      if ! pods_of_sts_exist; then
+        if ! create_fix_pod "$PVC"; then
+          log "ERROR: Fixpod preventivo falló mientras se esperaba ${STS}-0."
+        else
+          log "Fixpod preventivo creado mientras se esperaba ${STS}-0."
+        fi
+      fi
+    fi
     sleep 5
     t=$((t+1))
   done
@@ -498,15 +699,19 @@ wait_all_replicas_ready(){
 }
 
 should_recover(){
-  local replicas
+  local replicas ready
   replicas=$(get_replicas || echo 0)
+  ready=$(count_ready_pods || echo 0)
+
   if [ "$replicas" -eq 0 ]; then 
     return 1
   fi
-  
-  local ready
-  ready=$(count_ready_pods || echo 0)
+
   if [ "$ready" -eq 0 ]; then 
+    return 0
+  fi
+
+  if [ "$ready" -lt "$replicas" ]; then
     return 0
   fi
   
@@ -515,10 +720,27 @@ should_recover(){
 
 recovery_once(){
   local start_time=$(date +%s)
+  local ready current_replicas
+  ready=$(count_ready_pods || echo 0)
+  current_replicas=$(get_replicas || echo 0)
   
   log "=========================================="
   log ">>> INICIANDO RECUPERACIÓN OPTIMIZADA"
   log "=========================================="
+
+  if [ "$ready" -gt 0 ]; then
+    log "Cluster con ${ready}/${current_replicas} pods Ready detectado. Evitando flujo destructivo y reforzando escalado a ${DESIRED_REPLICAS}."
+    send_slack_warning "Cluster parcialmente operativo (${ready}/${DESIRED_REPLICAS} Ready). Ajustando solo el escalado a ${DESIRED_REPLICAS} réplicas."
+    scale_sts "$DESIRED_REPLICAS"
+    if wait_all_replicas_ready "$DESIRED_REPLICAS"; then
+      log "✓ Escalado correctivo completado sin flujo destructivo."
+      send_slack_info "Escalado correctivo completado. ${DESIRED_REPLICAS} réplicas listas en ${NS}/${STS}."
+      return 0
+    else
+      log "⚠️ Escalado correctivo no alcanzó todas las réplicas Ready. Continuando con flujo completo de recuperación."
+      send_slack_warning "El escalado correctivo no logró ${DESIRED_REPLICAS} réplicas Ready. Iniciando recuperación completa."
+    fi
+  fi
   
   # SIEMPRE USAR 3 RÉPLICAS PARA HA - IGNORAR EL ESTADO ACTUAL
   local desired_replicas="$DESIRED_REPLICAS"
@@ -629,6 +851,7 @@ log "Timeouts optimizados: Pod Creation: ${POD_CREATION_TIMEOUT}s, Pod Ready: ${
 
 # Mostrar réplicas actuales al inicio y configuración HA
 current_replicas=$(get_replicas)
+ORIGINAL_REPLICAS="$current_replicas"
 log "Réplicas actuales detectadas: ${current_replicas}"
 log "CONFIGURACIÓN HA: Siempre escalando a ${DESIRED_REPLICAS} réplicas para Alta Disponibilidad"
 ensure_minimum_replicas
@@ -670,11 +893,34 @@ while true; do
   fi
   
   if [ "$lock_state" != "none" ] && [ "$force_run" -eq 0 ]; then
+    if [ "$lock_state" = "cooloff" ]; then
+      ready=$(count_ready_pods || echo 0)
+      replicas=$(get_replicas || echo 0)
+      if [ "$replicas" -lt "$DESIRED_REPLICAS" ]; then
+        log "Lock en cooldown pero StatefulSet quedó con ${replicas} réplicas. Reescalando a ${DESIRED_REPLICAS}."
+        scale_sts "$DESIRED_REPLICAS"
+      fi
+      if [ "$ready" -ge "$DESIRED_REPLICAS" ]; then
+        log "Cluster recuperado (${ready}/${replicas} Ready) durante cooldown; liberando lock."
+        clear_lock
+        lock_state="none"
+        continue
+      fi
+    fi
     if [ $((iteration % 6)) -eq 0 ]; then
       log "Lock activo (${lock_state}), esperando..."
     fi
     sleep "$SLEEP_SECONDS"
     continue
+  fi
+
+  if [ "$force_run" -eq 1 ]; then
+    if handle_force_mode; then
+      force_run=0
+      log "Modo --force completado sin ejecutar recuperación completa. Retomando monitoreo continuo."
+      sleep "$SLEEP_SECONDS"
+      continue
+    fi
   fi
 
   ensure_minimum_replicas
@@ -689,6 +935,11 @@ while true; do
       # Esperar un poco más después de recuperación exitosa
       sleep 30
     else
+      post_fail_replicas=$(get_replicas || echo 0)
+      if [ "$post_fail_replicas" -lt "$DESIRED_REPLICAS" ]; then
+        log "Recuperación fallida dejó ${post_fail_replicas} réplicas. Reforzando escalado a ${DESIRED_REPLICAS} antes del cooldown."
+        scale_sts "$DESIRED_REPLICAS"
+      fi
       set_lock "cooloff"
       log "Recuperación fallida, entrando en cooldown ${COOLOFF_ON_FAIL}s."
       sleep "$COOLOFF_ON_FAIL"
