@@ -1,197 +1,233 @@
-0. Prerequisites
-```bash
-helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
-helm repo update
-```
+# MariaDB Galera HA Toolkit
 
-1. Install NFS Subdir External Provisioner
-
-```bash
-❯ helm upgrade --install nfs-subdir-external-provisioner -n mariadb \
-    nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-    --set nfs.server=10.9.9.27 \
-    --set nfs.path=/mnt/valutwarden \
-    --set storageClass.name=nfs-client \
-    --set storageClass.defaultClass=false \
-    --set nfs.mountOptions={vers=4.1} 
-```
-
-## Despliegue recomendado (Helm + script)
-
-1. Ajusta `mariadb-config.yaml` con tus parámetros (namespace, credenciales, storage, registry).
-2. Ejecuta el script limpio de despliegue:
-
-```bash
-./deploy-mariadb-ha-v2.sh            # usa mariadb-config.yaml por defecto
-# o
-./deploy-mariadb-ha-v2.sh -c otro-config.yaml
-```
-
-El script creará/actualizará el secreto de credenciales, generará un `values.yaml` temporal y lanzará `helm upgrade --install` para `bitnami/mariadb-galera`. Al finalizar mostrará el estado y cómo obtener la contraseña.
-
-3. Para desinstalar y limpiar PVC/PV en caso de reinstalación completa:
-
-```bash
-./uninstall-mariadb-ha.sh --delete-data-pvcs --force
-```
-
-El script eliminará la release, los PVC y los PV huérfanos asociados. Añade `--delete-namespace` o `--delete-storage-class` si necesitas borrar esos recursos también.
+Colección de scripts para desplegar, validar, recuperar y administrar clústeres MariaDB Galera en Kubernetes con un alto nivel de automatización. Está pensada para entornos donde se requiere bootstrap seguro, almacenamiento NFS compartido, backups programados y un watchdog con alertas.
 
 ---
 
-### Campos relevantes en `mariadb-config.yaml`
-
-```yaml
-registry:
-  url: "tanzu-harbor.pngd.gob.pe/pcm"            # Host (puede incluir prefijo de proyecto)
-  pullSecret: "harbor-registry-secret"
-  repository: "mariadb-galera"                   # Repositorio de la imagen principal (ej: mef/mariadb-galera)
-  tag: "12.0.2-debian-12-r0"
-  metricsRepository: "mysqld-exporter"           # Opcional: repositorio para el exporter
-  metricsTag: "0.17.2-debian-12-r16"
-  volumePermissionsRepository: "os-shell"        # Opcional: repositorio para el init de permisos
-  volumePermissionsTag: "12-debian-12-r36"
-```
+## 1. Requisitos Previos
+- Acceso a un clúster Kubernetes con privilegios administrativos (`kubectl` configurado).
+- Herramientas locales: `kubectl`, `helm`, `yq`, `bash`, `curl`, `uuidgen` (o similar). Para algunas rutas de recuperación se usa `jq` y `python3`.
+- Acceso a un repositorio de imágenes (por ejemplo, Harbor) y a un punto de montaje NFS accesible desde todos los nodos.
+- Para ejecutar el watchdog como servicio: máquina Linux con `systemd`, privilegios `sudo` y conectividad hacia el clúster.
 
 ---
 
-2. Install mariadb in high availability mode (YAML estático legado)
+## 2. Estructura del Repositorio
+
+| Archivo / Carpeta | Descripción |
+|-------------------|-------------|
+| `mariadb-dev.yaml` | Plantilla de configuración con parámetros de despliegue, credenciales, Storage y políticas de limpieza. |
+| `deploy-mariadb-ha.sh` | Script principal de despliegue/actualización del chart `bitnami/mariadb-galera`, detecta primer deploy y gestiona bootstrap seguro. |
+| `check-mariadb-ha.sh` | Validador del estado del clúster (pods, Galera, servicios, PVCs). |
+| `uninstall-mariadb-ha.sh` | Desinstalador con opciones para eliminar PVCs, namespace, StorageClass y secretos. |
+| `mariadb-ha-watchdog.sh` | Watchdog que repara clústeres completamente caídos, limpia artefactos de Galera y escala a las réplicas deseadas. |
+| `install-service.sh` / `uninstall-watchdog-service.sh` | Scripts para instalar/desinstalar el watchdog como servicio `systemd`. |
+| `mariadb-ha-watchdog.service` | Plantilla del unit file de `systemd` (para ajustes manuales). |
+
+> Nota: Revisa las plantillas antes de ejecutar en producción; las contraseñas incluidas son de demostración.
+
+---
+
+## 3. Flujo de Trabajo Sugerido
+
+1. Ajusta la configuración base (`mariadb-dev.yaml`) con tus datos y guárdala como `mariadb-config.yaml`.
+2. Asegura que exista un provisioner NFS (puedes reutilizar uno general o dejar que el script despliegue uno dedicado).
+3. Ejecuta `./deploy-mariadb-ha.sh` (o `-c <archivo>`).
+4. Valida el entorno con `./check-mariadb-ha.sh`.
+5. Instala el watchdog como servicio si necesitas recuperación automática en caso de fallos.
+6. Programa revisiones periódicas de backups y estado; desinstala con `./uninstall-mariadb-ha.sh` cuando sea necesario.
+
+---
+
+## 4. Configuración (`mariadb-config.yaml`)
+
+La plantilla incluye todas las secciones claves. Principales campos:
+
+| Sección | Campos | Explicación |
+|---------|--------|-------------|
+| `deployment` | `name`, `namespace`, `chartVersion` | Identidad del release Helm y namespace de destino. |
+| `storage` | `className`, `size`, `nfs.server`, `nfs.path` | Detalle del StorageClass y punto NFS. |
+| `credentials` | `rootPassword`, `username`, `password`, `database`, `backupPassword` | Credenciales iniciales del chart y de SST/backup. |
+| `registry` | `url`, `pullSecret` | Registry privado a usar y secreto asociado. |
+| `ha` | `replicaCount`, `minAvailable` | Parámetros de alta disponibilidad y pod disruption budget. |
+| `resources` | `requests/limits`, `vpa` | Límites por pod y política de Vertical Pod Autoscaler. |
+| `backup` | `enabled`, `schedule`, `retention` | CronJob de backups lógicos (`mysqldump` + gzip). |
+| `galera` | `enabled` | Mantén en `true` para desplegar Galera (bootstrap automático). |
+| `debug` | `enabled` | Incrementa verbosidad del chart. |
+| `cleanup` | `deleteDataPVCs`, `deleteNamespace`, `deleteStorageClass`, `deletePullSecret`, `force` | Se usan por el desinstalador como defaults. |
+
+> Recomendación: almacena las credenciales reales en un gestor de secretos o Kubernetes Secret y evita versionarlas.
+
+---
+
+## 5. Despliegue Automatizado (`deploy-mariadb-ha.sh`)
+
+### Uso Básico
 ```bash
-kubectl apply -f mariadb.yaml -n mariadb
+./deploy-mariadb-ha.sh                # usa mariadb-config.yaml
+./deploy-mariadb-ha.sh -c otra.yaml   # ruta personalizada
 ```
 
-# @mariadb-ha-watchdog.sh — Watchdog para recuperación automática de StatefulSet MariaDB/Galera
+### Funcionalidad Clave
+- Valida dependencias (`kubectl`, `helm`, `yq`).
+- Crea namespace, provisioner NFS dedicado y StorageClass si no existen.
+- Detecta primer despliegue (sin release, sin PVCs, sin ConfigMap) y habilita bootstrap seguro de Galera (`forceBootstrap`, `bootstrapFromNode=0`, `safe_to_bootstrap=1`).
+- Genera un `values.yaml` temporal con configuración completa (servicios, probes, métricas, seguridad, etc.).
+- Lanza `helm upgrade --install` con passwords por `--set-string`.
+- Si hay un release existente pero sin pods `Ready`, realiza recuperación forzada: escala a 0, crea pod temporal, limpia `galera.cache`/`gvwstate.dat`, ajusta `grastate.dat`, escala primero a 1 y luego al número deseado.
+- Crea un CronJob de backup (`<deployment>-backup`) y su PVC `RWX`.
+- Crea/actualiza un `VerticalPodAutoscaler` apuntando al StatefulSet del chart.
+- Muestra estado final de pods, PVCs y datos de conexión (servicio clusterIP y headless).
 
-`@mariadb-ha-watchdog.sh` es un script de bash que actúa como watchdog para un StatefulSet (STS) de MariaDB con Galera en Kubernetes. Detecta cuando todos los pods del STS están caídos y realiza una recuperación automática segura.
+### Flags Disponibles
+- `-c, --config <archivo>`: usa un YAML diferente a `mariadb-config.yaml`.
+- `-h, --help`: muestra ayuda resumida.
 
----
-
-## Objetivo
-
-Detectar caídas totales del cluster MariaDB/Galera (todos los pods caídos) y realizar:
-
-- Escalado a 0 réplicas para eliminar pods.
-- Creación de un pod temporal que monta el PVC del nodo 0.
-- Limpieza de archivos conflictivos (galera.cache, gcache, etc).
-- Modificación segura de `grastate.dat` para permitir bootstrap.
-- Escalado a 1 réplica para bootstrap.
-- Escalado a las réplicas deseadas.
-
----
-
-## Requisitos
-
-- `kubectl` instalado y configurado con acceso al cluster.
-- Imagen Docker accesible para el pod temporal con herramientas básicas (`sh`, `kubectl exec`).
-- Opcionalmente `jq` para conteo preciso de pods Ready.
+> El script usa el namespace `infra` para instalar el provisioner NFS dedicado; ajusta manualmente si tu clúster usa una convención diferente.
 
 ---
 
-## Variables configurables (variables de entorno)
+## 6. Verificación del Clúster (`check-mariadb-ha.sh`)
 
-| Variable                 | Descripción                                                     | Valor por defecto                                             |
-|-------------------------|-----------------------------------------------------------------|---------------------------------------------------------------|
-| `NS`                    | Namespace donde está el StatefulSet                              | `nextcloud`                                                   |
-| `STS`                   | Nombre del StatefulSet                                           | `mariadb`                                                     |
-| `CTX`                   | Contexto de Kubernetes (`kubectl --context`) **REQUIRED**       | *Ninguno* (el script termina si no está definido)             |
-| `PVC`                   | PVC principal del pod `STS-0`                                    | *Requerido* (sin valor el script aborta)                      |
-| `DATA_DIR`              | Directorio donde se monta el PVC en el pod temporal              | `/bitnami/mariadb`                                            |
-| `FIX_IMAGE`             | Imagen Docker para el pod temporal de reparación                | `tanzu-harbor.pngd.gob.pe/pcm/mariadb-galera:12.0.2-debian-12-r0` |
-| `SLEEP_SECONDS`         | Intervalo entre chequeos del watchdog (segundos)                | `30`                                                          |
-| `TMP_DIR`               | Directorio temporal base para locks                             | `mktemp -d -t ha-watchdog-XXXXXX`                             |
-| `LOCK_FILE`             | Archivo lock (`ts/state`)                                        | `${TMP_DIR}/watchdog.lock`                                    |
-| `LOCK_TTL`              | Tiempo máximo para lock en estado "cooloff" (segundos)          | `600`                                                         |
-| `COOLOFF_ON_FAIL`       | Tiempo de espera tras recuperación fallida (segundos)           | `90`                                                          |
-| `RUNNING_STALE`         | Tiempo para limpiar lock "running" colgado (segundos)           | `300`                                                         |
-| `WAIT_POD_DELETE_TIMEOUT` | Timeout para esperar eliminación de pods                       | `180s`                                                        |
-| `WAIT_FIX_READY_TIMEOUT` | Timeout para esperar pod temporal listo                         | `180s`                                                        |
-| `WAIT_STS_READY_TIMEOUT` | Timeout para esperar `STS-0` listo                              | `300s`                                                        |
-| `DESIRED_REPLICAS_DEFAULT` | Réplicas por defecto si no se detecta valor en StatefulSet    | `3`                                                           |
-| `SLACK_WEBHOOK_URL`     | Webhook para notificaciones de Slack (opcional)                 | *Vacío* (no envía alertas si no se define)                    |
-
----
-
-## Uso
-
+### Uso
 ```bash
-# Definir contexto y lanzar watchdog
-CTX=wso2-prod-tpm NS=wso2 STS=mariadb ./mariadb-ha-watchdog.sh
-
-# Limpiar lock manualmente
-./mariadb-ha-watchdog.sh --unlock
-
-# Forzar ejecución ignorando lock
-./mariadb-ha-watchdog.sh --force
+./check-mariadb-ha.sh          # lee mariadb-config.yaml
+./check-mariadb-ha.sh -c prod.yaml
+./check-mariadb-ha.sh --help
 ```
 
-### Notificaciones a Slack
+### Qué Valida
+- Estado y reinicios de pods (`Running` y `Ready`).
+- Variables clave de Galera (`wsrep_cluster_status`, `wsrep_ready`, `wsrep_cluster_size`, `wsrep_connected`).
+- Servicios y Endpoints asociados al release Helm.
+- PVCs con etiqueta `app.kubernetes.io/instance=<deployment>`.
+- Obtiene la contraseña root desde el config o del secreto `<deployment>-mariadb-galera`.
 
-Si configuras `SLACK_WEBHOOK_URL`, el watchdog enviará cada mensaje de log al canal (incluidos los pasos de diagnóstico y recuperación). Recomendado exportar la variable junto con otras credenciales:
+El script resume errores y advertencias al final y retorna código de salida distinto de cero si se detectan incidencias.
 
+---
+
+## 7. Watchdog de Recuperación (`mariadb-ha-watchdog.sh`)
+
+### Objetivo
+Mantener el StatefulSet de Galera con al menos 3 réplicas y recuperar automáticamente el clúster si todas las instancias caen (por ejemplo, tras un corte de energía).
+
+### Características
+- Doble lock (`running` y `cooloff`) para evitar ejecuciones simultáneas.
+- Ajuste automático de `safe_to_bootstrap` y limpieza de artefactos (`galera.cache`, `gvwstate.dat`, etc.).
+- Escalado a `DESIRED_REPLICAS` (default 3) si detecta réplicas insuficientes.
+- Notificaciones opcionales a Slack.
+- Intervalos y timeouts configurables (creación/eliminación de pods, readiness, cooldown).
+
+### Variables Importantes
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `NS` | Namespace del StatefulSet | `nextcloud` |
+| `STS` | StatefulSet a monitorear | `mariadb` |
+| `CTX` | Contexto de kubeconfig (obligatorio) | – |
+| `PVC` | PVC principal (`data-<sts>-0`) | – |
+| `DATA_DIR` | Ruta de datos en el pod temporal | `/bitnami/mariadb` |
+| `FIX_IMAGE` | Imagen usada para limpiar datos | `busybox:1.36` |
+| `DESIRED_REPLICAS` | Réplicas a garantizar | `3` |
+| `SLACK_WEBHOOK_URL` | Webhook de Slack (opcional) | vacío |
+| `SLEEP_SECONDS` | Intervalo de chequeo | `30` |
+
+### Ejecución Manual
 ```bash
-export CTX=mi-contexto-k8s
-export NS=mi-namespace
-export STS=mariadb
-export PVC=data-mariadb-0
-export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/XXXXXXXX
-./mariadb-ha-watchdog.sh
+export CTX=mi-contexto
+export NS=database-dev
+export STS=mariadb-galera-dev
+export PVC=data-mariadb-galera-dev-0
+./mariadb-ha-watchdog.sh              # monitoreo continuo
+./mariadb-ha-watchdog.sh --force      # fuerza ejecución inmediata
+./mariadb-ha-watchdog.sh --unlock     # elimina lock residual
 ```
 
-- Autoajuste de réplicas: si detecta menos réplicas configuradas que las requeridas por HA, escala de inmediato el StatefulSet al mínimo (`DESIRED_REPLICAS`, por defecto 3) y notifica la acción.
-- Tras autoescalar, espera a que las réplicas queden Ready; reporta el éxito o advierte por Slack si no se logra el estado deseado a tiempo.
-
-## Instalar servicio systemd
+### Instalación como Servicio systemd
 
 ```bash
 sudo ./install-service.sh \
   -n database-dev \
   -s mariadb-galera-dev \
-  -p data-mariadb-galera-dev-0 \
   -c wso2-prod-tmp \
-  -w https://hooks.slack.com/services/T00000/XXXXXXXXX/XXXXXXXXXXXXXX \
-  -d "MariaDB Galera HA Watchdog (WSO2 - DEV)"
+  -p data-mariadb-galera-dev-0 \
+  -d "MariaDB Galera HA Watchdog (WSO2 - DEV)" \
+  -w https://hooks.slack.com/services/XXXX/XXXX/XXXX
 ```
 
-### Comandos útiles
+El servicio se registra como `mariadb-ha-watchdog-<ns>-<sts>-<ctx>.service`. Comandos útiles:
+```bash
+systemctl status mariadb-ha-watchdog-...service
+journalctl -u mariadb-ha-watchdog-...service -f
+systemctl list-units --type=service --state=running | grep watchdog
+```
 
-- Ver servicios watchdog en ejecución  
-  `systemctl list-units --type=service --state=running | grep watchdog`
-- Revisar estado puntual del servicio  
-  `systemctl status mariadb-ha-watchdog-database-dev-mariadb-galera-dev-wso2-prod-tmp.service`
-- Seguir logs en vivo  
-  `journalctl -u mariadb-ha-watchdog-database-dev-mariadb-galera-dev-wso2-prod-tmp.service -f`
-- Reinstalar con nuevos parámetros  
-  `sudo ./install-service.sh ...` (usar flags anteriores)
-- Desinstalar (detiene, deshabilita y elimina el unit)  
-  `sudo ./uninstall-watchdog-service.sh -n database-dev -s mariadb-galera-dev -c wso2-prod-tmp [-b]`
-
-El flag opcional `-b` elimina también `/usr/local/bin/mariadb-ha-watchdog.sh` siempre que no
-queden otros servicios watchdog registrados en la máquina.
-
-### Desinstalación completa del servicio watchdog
-
+Para removerlo:
 ```bash
 sudo ./uninstall-watchdog-service.sh \
   -n database-dev \
   -s mariadb-galera-dev \
   -c wso2-prod-tmp \
-  -b
+  -b    # elimina /usr/local/bin/mariadb-ha-watchdog.sh si no hay otros servicios
 ```
 
-Acciones realizadas:
+La plantilla `mariadb-ha-watchdog.service` sirve si necesitas personalizar manualmente usuario, `KUBECONFIG`, límites, etc.
 
-- Detiene y deshabilita `mariadb-ha-watchdog-<ns>-<sts>-<ctx>.service`.
-- Elimina el unit file de `/etc/systemd/system/`.
-- Recarga el daemon de systemd.
-- (Opcional, `-b`) borra `/usr/local/bin/mariadb-ha-watchdog.sh` si no quedan otros servicios watchdog instalados.
+---
 
-Antes de ejecutar la desinstalación, puedes comprobar los servicios activos con:
+## 8. Backups Automáticos
 
+Cuando `backup.enabled=true`, el despliegue crea:
+- `CronJob <deployment>-backup`: ejecuta diariamente `mysqldump` + `gzip` y almacena en `/backup`.
+- `PVC <deployment>-backup-pvc`: almacenamiento `RWX` de 50 Gi (ajustable editando el script o el YAML).
+
+Los dumps se nombran `backup-YYYYMMDD-HHMMSS.sql.gz`. Se eliminan automáticamente los más antiguos que el parámetro `retention`.
+
+Para restaurar un backup, monta el PVC en un pod utilitario o descarga el archivo vía `kubectl cp`.
+
+---
+
+## 9. Desinstalación y Limpieza (`uninstall-mariadb-ha.sh`)
+
+### Uso Básico
 ```bash
-systemctl list-units --type=service --state=running | grep watchdog
+./uninstall-mariadb-ha.sh \
+  -c mariadb-config.yaml \
+  --delete-data-pvcs \
+  --delete-namespace \
+  --delete-storage-class \
+  --delete-pull-secret \
+  --force
 ```
 
-> Nota: Los comandos anteriores asumen que el servicio se generó con el patrón
-> `mariadb-ha-watchdog-<namespace>-<statefulset>-<context>.service`. Ajusta los
-> nombres según tu despliegue.
+### Qué Elimina
+- Release Helm (`helm uninstall`).
+- CronJobs de backup y PVC asociados (incluyendo PV huérfanos).
+- Opcional: namespace del despliegue, StorageClass generado y pull secret.
+- Respeta flags definidas en `cleanup` del YAML, aunque los parámetros de CLI tienen prioridad.
 
+`--force` omite confirmación interactiva (útil para pipelines). Si no se usa `--force`, pedirá confirmación antes de proceder.
+
+---
+
+## 10. Troubleshooting & Tips
+
+- **Errores de montaje NFS:** revisa `kubectl get events -n <ns>`; verifica permisos y opciones `mountOptions`.
+- **Bootstrap manual necesario:** elimina PVCs o borra el ConfigMap `<deployment>-galera-state` para forzar que el deploy se comporte como primer despliegue.
+- **Sin soporte de VPA:** el script intenta instalar los CRDs oficiales (`autoscaler/vpa`). Si no tienes permisos de red para descargarlos, crea los recursos manualmente o deshabilita `resources.vpa.enabled`.
+- **Contraseñas:** si el `values.yaml` temporal se elimina, la salida del script muestra solo ubicaciones; usa secretos antes de compartir logs.
+- **Watchdog sin acceso a kubeconfig:** asegúrate de definir `KUBECONFIG` en el unit file o exportarlo antes de ejecutar manualmente.
+- **Slack:** el watchdog utiliza `python3` para escapar el payload; instala `python3` en el host o desactiva la notificación.
+- **Validaciones fallan con `x509`:** revisa tu kubeconfig y certificado de cluster; el watchdog y los scripts comparten la misma configuración.
+
+---
+
+## 11. Buenas Prácticas
+- Mantén el archivo de configuración fuera del repositorio público (usa un repositorio privado o herramienta de secretos).
+- Revisa periódicamente el tamaño del PVC de backups; rota los archivos si usas retenciones largas.
+- Integra los scripts en pipelines de CI/CD para despliegues y validaciones consistentes.
+- Documenta internamente cualquier cambio en imágenes personalizadas, rutas NFS o políticas de seguridad.
+
+---
+
+Proyecto mantenido por el equipo de la PNGD.
