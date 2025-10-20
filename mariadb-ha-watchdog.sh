@@ -51,6 +51,18 @@ check_api() {
   kubectl --request-timeout=5s version >/dev/null 2>&1
 }
 
+try_restart_systemd_service(){
+  local service_name="$1"
+  if ! have_cmd systemctl; then
+    return 1
+  fi
+  if systemctl restart "$service_name" >/dev/null 2>&1; then
+    send_slack_info "Reinicio solicitado para el servicio systemd ${service_name}."
+    return 0
+  fi
+  return 1
+}
+
 # ----- Slack Notifications -----
 send_slack_notification() {
   local message="$1"
@@ -738,7 +750,15 @@ recovery_once(){
       return 0
     else
       log "⚠️ Escalado correctivo no alcanzó todas las réplicas Ready. Continuando con flujo completo de recuperación."
-      send_slack_warning "El escalado correctivo no logró ${DESIRED_REPLICAS} réplicas Ready. Iniciando recuperación completa."
+      local suggest_service="mariadb-ha-watchdog-${NS}-${STS}-${CTX}.service"
+      if try_restart_systemd_service "$suggest_service"; then
+        send_slack_warning "El escalado correctivo no logró ${DESIRED_REPLICAS} réplicas Ready. Se solicitó reinicio automático del servicio \`${suggest_service}\`."
+        log "Saliendo tras solicitar reinicio del servicio ${suggest_service}."
+        exit 0
+      else
+        log "ℹ️ Si estás ejecutando el watchdog como servicio systemd, reinícialo con: sudo systemctl restart ${suggest_service}"
+        send_slack_warning "El escalado correctivo no logró ${DESIRED_REPLICAS} réplicas Ready. Continuando con recuperación completa.\nSi el watchdog corre como servicio systemd, reinícialo con \`sudo systemctl restart ${suggest_service}\`."
+      fi
     fi
   fi
   
@@ -959,5 +979,4 @@ while true; do
     sleep "$SLEEP_SECONDS"
   fi
 done
-
 
